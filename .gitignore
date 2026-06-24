@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local agent/tooling state
+.agents/
+.claude/
+.codex/
+
+# Runtime files and secrets
+.server-console-token
+.server-console-preview.*
+*.log
+*.pid
+
+# Local backup files
+*.bak
+*.b.bak
+
+# Xcode
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# macOS
+.DS_Store

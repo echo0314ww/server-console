@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#101418">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Server Console">
+  <title>Server Console</title>
+  <link rel="manifest" href="/manifest.webmanifest?v=70">
+  <link rel="apple-touch-icon" href="/icons/icon.svg">
+  <link rel="stylesheet" href="/vendor/xterm/xterm.min.css">
+  <link rel="stylesheet" href="/styles.css?v=70">
+</head>
+<body>
+  <main class="app-shell">
+    <section id="connectionPanel" class="connection-panel" aria-label="连接设置">
+      <div class="status-row">
+        <button id="connectionToggleButton" class="toggle-button" type="button" aria-label="折叠连接设置" aria-expanded="true">⌄</button>
+        <span id="statusDot" class="status-dot"></span>
+        <span id="statusText" class="status-text">Disconnected</span>
+        <span id="sessionLabel" class="session-label">phone</span>
+        <div class="status-actions">
+          <button id="restartButton" class="secondary-button restart-button" type="button" aria-label="New terminal" title="New terminal" disabled>New</button>
+          <button id="refreshButton" class="secondary-button refresh-button" type="button" aria-label="刷新前端到最新版本" title="Refresh app">Refresh</button>
+          <button id="connectButton" class="primary-button" type="button">Connect</button>
+        </div>
+      </div>
+      <div id="statusDetail" class="status-detail" aria-live="polite"></div>
+      <div id="connectionDetails" class="connection-details">
+        <label class="field">
+          <span>WebSocket URL</span>
+          <input id="serverUrl" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false">
+        </label>
+      </div>
+    </section>
+
+    <section class="terminal-wrap" aria-label="终端">
+      <div id="terminal" class="terminal"></div>
+      <div id="cwdOverlay" class="path-overlay" hidden></div>
+      <div id="restoreOverlay" class="restore-overlay" hidden aria-live="polite">
+        <span class="restore-spinner" aria-hidden="true"></span>
+        <span id="restoreOverlayText">Restoring session</span>
+      </div>
+      <button id="newOutputButton" class="new-output-button" type="button" hidden>Latest</button>
+    </section>
+
+    <section class="command-panel" aria-label="命令输入">
+      <div id="slashStrip" class="slash-strip" hidden></div>
+      <div class="tool-row tool-row-primary">
+        <button id="escButton" class="tool-button" type="button" aria-label="发送 Escape">Esc</button>
+        <button id="slashButton" class="tool-button" type="button" aria-label="插入斜杠">/</button>
+        <button id="upButton" class="tool-button" type="button" aria-label="向上选择">↑</button>
+        <button id="downButton" class="tool-button" type="button" aria-label="向下选择">↓</button>
+        <button id="enterButton" class="tool-button mobile-enter-button" type="button" aria-label="发送 Enter">Enter</button>
+      </div>
+      <div class="command-row">
+        <textarea id="commandInput" rows="1" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Command or / action"></textarea>
+      </div>
+    </section>
+  </main>
+
+  <script src="/vendor/xterm/xterm.min.js"></script>
+  <script src="/vendor/xterm/addon-fit.min.js"></script>
+  <script src="/app.js?v=70" type="module"></script>
+</body>
+</html>

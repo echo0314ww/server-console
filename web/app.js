@@ -38,19 +38,24 @@ const closeBeforeReconnectDelayMs = 300;
 const connectTimeoutMs = 10000;
 const foregroundReconnectDelayMs = 250;
 const outputFlushIntervalMs = 32;
-const outputFlushMaxChars = 16 * 1024;
-const outputFlushChunkChars = 8 * 1024;
+const outputFlushMaxChars = 24 * 1024;
+const outputFlushChunkChars = 24 * 1024;
 const terminalReviewOutputPauseMs = 900;
+const latestFollowLockMs = 900;
 const restoreFallbackCompleteMs = 700;
 const appHeightChangeThresholdPx = 2;
 const viewportLayoutSettleMs = 700;
 const keyboardActivityWindowMs = 3000;
+const keyboardResizeSettleMs = 180;
 const backgroundSuspendDelayMs = 2500;
 const terminalFitRetryDelayMs = 90;
 const terminalFitMaxRetries = 6;
+const stableLayoutDelaysMs = [90, 240, 520, 900];
+const restartLayoutDelaysMs = [0, 80, 220, 520, 900];
 const viewportContent = "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover";
 const encoder = new TextEncoder();
 let terminalDecoder = new TextDecoder();
+const hasNativeFromBase64 = typeof Uint8Array.fromBase64 === "function";
 const viewportMeta = document.querySelector("meta[name=\"viewport\"]");
 const commandInputPlaceholder = commandInput.getAttribute("placeholder") || "";
 let commandInputEmptyState = null;
@@ -121,11 +126,14 @@ let terminalViewportElement = null;
 let terminalResizeObserver = null;
 let terminalFitRetryTimer = 0;
 let terminalFitRetryCount = 0;
+let terminalBottomSettleToken = 0;
 let compactViewportMediaQuery = null;
 let compactViewportMatches = false;
 let compactViewportClassApplied = null;
 let viewportLayoutFrame = 0;
 let viewportLayoutDelayTimer = 0;
+let stableLayoutTimers = [];
+let restartLayoutTimers = [];
 let newOutputButtonHidden = true;
 let lastViewportHeight = 0;
 let lastViewportWidth = 0;
@@ -137,10 +145,13 @@ let lastConnectButtonAriaLabel = "";
 let lastRestartButtonDisabled = null;
 let commandInputHeight = 0;
 let newOutputButtonUpdateFrame = 0;
+let latestButtonActivatedAt = 0;
+let latestFollowLockedUntil = 0;
 let connectionCollapsedApplied = null;
 let lastNewOutputButtonHidden = null;
 let restoreOverlayVisible = null;
 let lastRestoreOverlayText = "";
+let layoutDebugUntil = 0;
 
 viewportMeta?.setAttribute("content", viewportContent);
 forgetStoredCommandInputState();
@@ -195,7 +206,9 @@ slashButton.addEventListener("click", event => { event.preventDefault(); sendKey
 upButton.addEventListener("click", event => { event.preventDefault(); sendKeySequence("\x1b[A"); });
 downButton.addEventListener("click", event => { event.preventDefault(); sendKeySequence("\x1b[B"); });
 enterButton.addEventListener("click", event => { event.preventDefault(); sendEnterAction(); });
-newOutputButton.addEventListener("click", scrollTerminalToLatest);
+newOutputButton.addEventListener("pointerdown", handleLatestButtonActivation);
+newOutputButton.addEventListener("touchend", handleLatestButtonActivation, { passive: false });
+newOutputButton.addEventListener("click", handleLatestButtonActivation);
 
 commandInput.addEventListener("input", () => {
   noteKeyboardActivity();
@@ -252,19 +265,23 @@ commandInput.addEventListener("blur", () => {
 window.addEventListener("resize", () => {
   noteViewportKeyboardActivity();
   scheduleViewportLayout();
+  scheduleStableTerminalLayout(shouldPreserveLatestForLayout());
 });
 window.addEventListener("orientationchange", () => {
   scheduleViewportLayout();
+  scheduleStableTerminalLayout(true);
 });
 if (window.visualViewport) {
   window.visualViewport.addEventListener("resize", () => {
     noteViewportKeyboardActivity();
     scheduleViewportLayout();
+    scheduleStableTerminalLayout(shouldPreserveLatestForLayout());
   });
   window.visualViewport.addEventListener("scroll", () => {
     if (terminalTouchActive || isUserReviewingOutput()) return;
     noteViewportKeyboardActivity();
     scheduleViewportLayout();
+    scheduleStableTerminalLayout(shouldPreserveLatestForLayout());
   });
 }
 window.addEventListener("pagehide", () => {
@@ -277,11 +294,13 @@ window.addEventListener("pagehide", () => {
 window.addEventListener("pageshow", () => {
   cancelBackgroundSuspend();
   scheduleViewportLayout();
+  scheduleStableTerminalLayout(true);
   reconnectWhenVisible();
 });
 window.addEventListener("focus", () => {
   cancelBackgroundSuspend();
   scheduleViewportLayout();
+  scheduleStableTerminalLayout(true);
   reconnectWhenVisible();
 });
 window.addEventListener("online", reconnectWhenVisible);
@@ -292,6 +311,7 @@ document.addEventListener("visibilitychange", () => {
   } else {
     cancelBackgroundSuspend();
     scheduleViewportLayout();
+    scheduleStableTerminalLayout(true);
     reconnectWhenVisible();
   }
 });
@@ -328,6 +348,47 @@ function scheduleViewportLayoutAfterDelay(delayMs = 80) {
     viewportLayoutDelayTimer = 0;
     scheduleViewportLayout();
   }, delayMs);
+}
+
+function scheduleStableTerminalLayout(forceStayAtBottom = false) {
+  clearStableLayoutTimers();
+  stableLayoutTimers = stableLayoutDelaysMs.map(delayMs => window.setTimeout(() => {
+    runTerminalLayoutPass(forceStayAtBottom, true);
+  }, delayMs));
+}
+
+function scheduleRestartTerminalLayout() {
+  clearRestartLayoutTimers();
+  layoutDebugUntil = Date.now() + 3000;
+  latestFollowLockedUntil = Math.max(latestFollowLockedUntil, Date.now() + viewportLayoutSettleMs + 400);
+  restartLayoutTimers = restartLayoutDelaysMs.map(delayMs => window.setTimeout(() => {
+    runTerminalLayoutPass(true, true);
+    scrollTerminalToBottom();
+    updateLayoutDebugStatus();
+  }, delayMs));
+}
+
+function clearStableLayoutTimers() {
+  if (!stableLayoutTimers.length) return;
+  for (const timer of stableLayoutTimers) {
+    window.clearTimeout(timer);
+  }
+  stableLayoutTimers = [];
+}
+
+function clearRestartLayoutTimers() {
+  if (!restartLayoutTimers.length) return;
+  for (const timer of restartLayoutTimers) {
+    window.clearTimeout(timer);
+  }
+  restartLayoutTimers = [];
+}
+
+function runTerminalLayoutPass(forceStayAtBottom = false, forceResize = false) {
+  syncVisualViewport();
+  syncCompactViewportClass();
+  fitTerminal(forceStayAtBottom);
+  sendResize({ force: forceResize });
 }
 
 if (shouldAutoConnect() && !nativeWrapperMode) {
@@ -603,6 +664,7 @@ function initTerminal() {
   fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
   term.open(terminalElement);
+  loadTerminalRenderer();
   terminalViewportElement = terminalElement.querySelector(".xterm-viewport");
   observeTerminalSize();
   fitTerminal(true);
@@ -610,7 +672,7 @@ function initTerminal() {
 
   const viewport = terminalViewport();
   if (viewport) {
-    viewport.addEventListener("scroll", handleTerminalScroll);
+    viewport.addEventListener("scroll", handleTerminalScroll, { passive: true });
     viewport.addEventListener("touchstart", handleTerminalTouchStart, { passive: true });
     viewport.addEventListener("touchmove", handleTerminalTouchMove, { passive: false });
     viewport.addEventListener("touchend", handleTerminalTouchEnd, { passive: true });
@@ -621,6 +683,48 @@ function initTerminal() {
   term.onData(data => {
     sendBytes(encoder.encode(data));
   });
+}
+
+function loadTerminalRenderer() {
+  // GPU-accelerated WebGL renderer is the fastest for heavy output; fall back to
+  // the Canvas renderer, then to the built-in DOM renderer. WebGL can lose its
+  // context (background tab, GPU reset) — dispose and drop to Canvas if that
+  // happens so the terminal keeps rendering instead of freezing.
+  if (loadWebglRenderer()) return;
+  loadCanvasRenderer();
+}
+
+function loadWebglRenderer() {
+  try {
+    const ns = window.WebglAddon;
+    const Ctor = ns && (ns.WebglAddon || ns);
+    if (typeof Ctor !== "function") return false;
+    const addon = new Ctor();
+    addon.onContextLoss?.(() => {
+      try {
+        addon.dispose();
+      } catch {
+        // Already disposed; fall through to the Canvas renderer regardless.
+      }
+      loadCanvasRenderer();
+    });
+    term.loadAddon(addon);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function loadCanvasRenderer() {
+  try {
+    const ns = window.CanvasAddon;
+    const Ctor = ns && (ns.CanvasAddon || ns);
+    if (typeof Ctor === "function") {
+      term.loadAddon(new Ctor());
+    }
+  } catch {
+    // Keep the built-in DOM renderer.
+  }
 }
 
 function connect() {
@@ -669,6 +773,7 @@ function connect() {
   }
 
   socket = currentSocket;
+  currentSocket.binaryType = "arraybuffer";
   terminalDecoder = new TextDecoder();
   lastSentResizeCols = 0;
   lastSentResizeRows = 0;
@@ -693,8 +798,8 @@ function connect() {
     if (isCompactViewport()) {
       setConnectionCollapsed(true);
     }
-    fitTerminal(followLatestOutput);
-    sendResize();
+    runTerminalLayoutPass(true, true);
+    scheduleStableTerminalLayout(true);
     focusTerminalIfIdle();
   });
 
@@ -723,6 +828,8 @@ function connect() {
 function disconnect(updateStatus = true, disableReconnect = true, clearCurrentSocket = true) {
   restartPending = false;
   resetRestoreState();
+  clearStableLayoutTimers();
+  clearRestartLayoutTimers();
   if (disableReconnect) {
     reconnectEnabled = false;
     rememberAutoConnect(false);
@@ -796,6 +903,8 @@ function suspendConnectionForBackground() {
     return;
   }
   if (!reconnectEnabled && !socket) return;
+  clearStableLayoutTimers();
+  clearRestartLayoutTimers();
   window.clearTimeout(reconnectTimer);
   window.clearInterval(reconnectCountdownTimer);
   window.clearTimeout(connectTimeoutTimer);
@@ -857,10 +966,14 @@ function sendDraft() {
     return;
   }
 
-  followLatestOutput = true;
-  hasUnreadOutput = false;
-  flushTerminalOutput(true, true);
-  scrollTerminalToBottom();
+  if (shouldAutoFollowLatest() || isTerminalAtBottom()) {
+    followLatestOutput = true;
+    hasUnreadOutput = false;
+    flushTerminalOutput(true, true);
+    scrollTerminalToBottom();
+  } else {
+    markUserReviewingOutput();
+  }
   draftSubmitPending = false;
   finishDraftSend();
 }
@@ -913,6 +1026,10 @@ function restartTerminal() {
   reconnectEnabled = true;
   rememberAutoConnect(true);
   reconnectAttempts = 0;
+  resetTerminalReviewState(true);
+  updateViewportLayout();
+  runTerminalLayoutPass(true, true);
+  scheduleRestartTerminalLayout();
   window.clearTimeout(reconnectTimer);
   window.clearInterval(reconnectCountdownTimer);
   window.clearTimeout(foregroundReconnectTimer);
@@ -921,7 +1038,21 @@ function restartTerminal() {
   discardPendingTerminalOutput();
   term?.clear();
   setStatus("connecting", "Restarting", "Starting a new terminal");
-  sendJson({ type: "restart" });
+  sendJson({ type: "restart", cols: term?.cols, rows: term?.rows });
+}
+
+function resetTerminalReviewState(lockLatest = false) {
+  if (lockLatest) {
+    latestFollowLockedUntil = Date.now() + latestFollowLockMs;
+    suppressTerminalScrollTracking(viewportLayoutSettleMs);
+  }
+  followLatestOutput = true;
+  hasUnreadOutput = false;
+  userReviewingOutput = false;
+  terminalTouchActive = false;
+  terminalReviewOutputPausedUntil = 0;
+  terminalReviewScrollTop = null;
+  updateNewOutputButton();
 }
 
 function discardPendingTerminalOutput() {
@@ -940,7 +1071,13 @@ function discardPendingTerminalOutput() {
 }
 
 function sendBytes(bytes) {
-  return sendRawJson(`{"type":"input","data":"${bytesToBase64(bytes)}"}`);
+  // Binary input frame: [0x00][raw bytes]. Avoids base64 inflation + encode cost.
+  if (!ensureSocketReady()) return false;
+  const frame = new Uint8Array(bytes.length + 1);
+  frame[0] = 0x00;
+  frame.set(bytes, 1);
+  socket.send(frame);
+  return true;
 }
 
 function sendToolByte(byte) {
@@ -959,12 +1096,6 @@ function sendJson(message) {
   return true;
 }
 
-function sendRawJson(payload) {
-  if (!ensureSocketReady()) return false;
-  socket.send(payload);
-  return true;
-}
-
 function ensureSocketReady() {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     if (term) term.write("\r\n[not connected]\r\n");
@@ -976,7 +1107,10 @@ function ensureSocketReady() {
 }
 
 function handleServerMessage(raw) {
-  if (handleFastOutputMessage(raw)) return;
+  if (raw instanceof ArrayBuffer) {
+    handleBinaryMessage(raw);
+    return;
+  }
 
   let message;
   try {
@@ -1013,38 +1147,36 @@ function handleServerMessage(raw) {
   }
 }
 
-function handleFastOutputMessage(raw) {
-  if (typeof raw !== "string") return false;
-
-  const prefix = "{\"type\":\"output\",\"data\":\"";
-  if (!raw.startsWith(prefix)) return false;
-
-  const dataEnd = raw.indexOf("\"", prefix.length);
-  if (dataEnd < 0) return false;
-
-  const rest = raw.slice(dataEnd + 1);
-  if (rest === "}") {
-    handleOutputPayload(raw.slice(prefix.length, dataEnd), 0);
-    return true;
+function handleBinaryMessage(buffer) {
+  // Binary data frame: [0x00][uint32 BE sequence][raw bytes]. The decoder must be
+  // advanced even for duplicate/skipped chunks so multi-byte UTF-8 sequences that
+  // straddle chunk boundaries stay aligned.
+  const view = new Uint8Array(buffer);
+  if (view.length < 1 || view[0] !== 0x00) return;
+  let sequence = 0;
+  let payloadStart = 1;
+  if (view.length >= 5) {
+    sequence = new DataView(buffer).getUint32(1, false);
+    payloadStart = 5;
   }
-
-  const sequencePrefix = ",\"seq\":";
-  if (!rest.startsWith(sequencePrefix) || !rest.endsWith("}")) return false;
-  const sequence = Number(rest.slice(sequencePrefix.length, -1));
-  if (!Number.isSafeInteger(sequence) || sequence <= 0) return false;
-  handleOutputPayload(raw.slice(prefix.length, dataEnd), sequence);
-  return true;
+  const text = terminalDecoder.decode(view.subarray(payloadStart), { stream: true });
+  ingestOutputText(text, sequence);
 }
 
 function handleOutputPayload(data, sequenceValue) {
+  // JSON/text output path (demo mode). decodeTerminalOutput advances the streaming
+  // decoder; ingestOutputText then decides whether to keep or drop the chunk.
+  ingestOutputText(decodeTerminalOutput(data || ""), sequenceValue);
+}
+
+function ingestOutputText(text, sequenceValue) {
   const sequence = normalizedOutputSequence(sequenceValue);
   const restoreChunk = takeRestoreOutputChunk();
   if (!restoreChunk && shouldSkipOutputSequence(sequence)) {
-    decodeTerminalOutput(data || "");
     noteSkippedRestoreChunk(restoreChunk);
     return;
   }
-  enqueueTerminalOutput(decodeTerminalOutput(data || ""), restoreChunk, sequence);
+  enqueueTerminalOutput(text, restoreChunk, sequence);
 }
 
 function normalizedOutputSequence(value) {
@@ -1179,7 +1311,7 @@ function enqueueTerminalOutput(text, restoreChunk = false, sequence = 0) {
   if (!wasFollowingLatest) {
     hasUnreadOutput = true;
   }
-  if (outputQueueChars >= outputFlushMaxChars) {
+  if (outputQueueChars >= outputFlushMaxChars && !shouldHoldTerminalOutputForReview()) {
     scheduleOutputFlush(0, true);
     return;
   }
@@ -1200,6 +1332,7 @@ function scheduleOutputFlush(delayMs, force = false) {
   if (!force && isTerminalReviewOutputPaused()) {
     delayMs = Math.max(delayMs, terminalReviewOutputPausedUntil - Date.now());
   }
+  if (!force && shouldHoldTerminalOutputForReview()) return;
   outputFlushTimer = window.setTimeout(() => {
     outputFlushTimer = 0;
     outputFlushHandle = window.requestAnimationFrame(() => flushTerminalOutput());
@@ -1215,6 +1348,11 @@ function flushTerminalOutput(flushAll = false, forceStayAtBottom = false) {
     window.cancelAnimationFrame(outputFlushHandle);
     outputFlushHandle = 0;
   }
+  if (!forceStayAtBottom && !flushAll && shouldHoldTerminalOutputForReview()) {
+    hasUnreadOutput = true;
+    updateNewOutputButton();
+    return;
+  }
   if (!forceStayAtBottom && !flushAll && isTerminalReviewOutputPaused()) {
     scheduleOutputFlush(terminalReviewOutputPausedUntil - Date.now());
     return;
@@ -1224,7 +1362,7 @@ function flushTerminalOutput(flushAll = false, forceStayAtBottom = false) {
     return;
   }
 
-  const reviewingOutput = isUserReviewingOutput() || terminalTouchActive || !isTerminalAtBottom();
+  const reviewingOutput = !forceStayAtBottom && !isLatestFollowLocked() && (isUserReviewingOutput() || terminalTouchActive || !isTerminalAtBottom());
   const preservedReviewScrollTop = reviewingOutput ? captureTerminalReviewScrollTop() : null;
   const text = takeQueuedTerminalOutput(flushAll === true ? outputQueueChars : outputFlushChunkChars);
   terminalWriteInProgress += 1;
@@ -1235,6 +1373,7 @@ function flushTerminalOutput(flushAll = false, forceStayAtBottom = false) {
       hasUnreadOutput = true;
     } else if (shouldStayAtBottom(forceStayAtBottom)) {
       scrollTerminalToBottom();
+      scheduleTerminalBottomSettle();
       followLatestOutput = true;
       hasUnreadOutput = false;
     } else if (!isTerminalAtBottom()) {
@@ -1287,7 +1426,7 @@ function compactOutputQueueIfNeeded() {
     outputQueueHead = 0;
     return;
   }
-  if (outputQueueHead > 64 && outputQueueHead * 2 > outputQueue.length) {
+  if (outputQueueHead > 128 && outputQueueHead * 2 > outputQueue.length) {
     outputQueue = outputQueue.slice(outputQueueHead);
     outputQueueHead = 0;
   }
@@ -1344,6 +1483,8 @@ function finishRestoreIfReady() {
   const shell = restoreShell || "shell";
   resetRestoreState();
   setStatus("connected", "Connected", `Session restored · ${shell}`);
+  runTerminalLayoutPass(true, true);
+  scheduleStableTerminalLayout(true);
 }
 
 function resetRestoreState() {
@@ -1422,16 +1563,21 @@ function scrollTerminalPages(direction) {
   commandInput.focus({ preventScroll: true });
 }
 
+function handleLatestButtonActivation(event) {
+  event?.preventDefault();
+  event?.stopPropagation();
+  const now = Date.now();
+  if (now - latestButtonActivatedAt < 120) return;
+  latestButtonActivatedAt = now;
+  scrollTerminalToLatest();
+}
+
 function scrollTerminalToLatest() {
-  followLatestOutput = true;
-  hasUnreadOutput = false;
-  userReviewingOutput = false;
-  terminalReviewOutputPausedUntil = 0;
-  terminalReviewScrollTop = null;
-  suppressTerminalScrollTracking(viewportLayoutSettleMs);
+  resetTerminalReviewState(true);
   flushTerminalOutput(true, true);
   if (!term) return;
   scrollTerminalToBottom();
+  scheduleTerminalBottomSettle();
   updateViewportLayout();
 }
 
@@ -1481,6 +1627,19 @@ function isTerminalAtBottom() {
 }
 
 function handleTerminalScroll() {
+  if (isLatestFollowLocked()) {
+    followLatestOutput = true;
+    hasUnreadOutput = false;
+    userReviewingOutput = false;
+    terminalReviewOutputPausedUntil = 0;
+    terminalReviewScrollTop = null;
+    if (!isTerminalAtBottom()) {
+      forceTerminalViewportToBottom();
+    }
+    updateNewOutputButton();
+    return;
+  }
+
   if (isTerminalScrollTrackingSuppressed()) {
     updateNewOutputButton();
     return;
@@ -1492,6 +1651,9 @@ function handleTerminalScroll() {
     userReviewingOutput = false;
     terminalReviewOutputPausedUntil = 0;
     terminalReviewScrollTop = null;
+    if (outputQueueChars > 0) {
+      scheduleOutputFlush(0, true);
+    }
   } else {
     markUserReviewingOutput();
   }
@@ -1500,6 +1662,7 @@ function handleTerminalScroll() {
 }
 
 function handleTerminalTouchStart(event) {
+  if (isLatestFollowLocked()) return;
   terminalTouchActive = true;
   terminalTouchStartY = event.touches?.[0]?.clientY || 0;
   terminalReviewScrollTop = terminalViewport()?.scrollTop ?? null;
@@ -1509,6 +1672,7 @@ function handleTerminalTouchStart(event) {
 }
 
 function handleTerminalTouchMove(event) {
+  if (isLatestFollowLocked()) return;
   const viewport = terminalViewport();
   const currentY = event.touches?.[0]?.clientY || terminalTouchStartY;
   const deltaY = currentY - terminalTouchStartY;
@@ -1523,12 +1687,24 @@ function handleTerminalTouchMove(event) {
 
 function handleTerminalTouchEnd() {
   terminalTouchActive = false;
+  if (isLatestFollowLocked()) {
+    followLatestOutput = true;
+    hasUnreadOutput = false;
+    userReviewingOutput = false;
+    terminalReviewOutputPausedUntil = 0;
+    terminalReviewScrollTop = null;
+    updateNewOutputButton();
+    return;
+  }
   if (isTerminalAtBottom()) {
     followLatestOutput = true;
     hasUnreadOutput = false;
     userReviewingOutput = false;
     terminalReviewOutputPausedUntil = 0;
     terminalReviewScrollTop = null;
+    if (outputQueueChars > 0) {
+      scheduleOutputFlush(0, true);
+    }
   } else {
     markUserReviewingOutput();
   }
@@ -1536,6 +1712,7 @@ function handleTerminalTouchEnd() {
 }
 
 function handleTerminalWheel(event) {
+  if (isLatestFollowLocked()) return;
   if (event.deltaY < 0 || !isTerminalAtBottom()) {
     markUserReviewingOutput();
   }
@@ -1566,6 +1743,17 @@ function setNewOutputButtonHidden(hidden) {
 }
 
 function markUserReviewingOutput() {
+  if (isLatestFollowLocked()) {
+    followLatestOutput = true;
+    hasUnreadOutput = false;
+    userReviewingOutput = false;
+    terminalReviewOutputPausedUntil = 0;
+    terminalReviewScrollTop = null;
+    updateNewOutputButton();
+    return;
+  }
+  terminalBottomSettleToken += 1;
+  pauseTerminalOutputFlush();
   followLatestOutput = false;
   hasUnreadOutput = true;
   userReviewingOutput = true;
@@ -1581,15 +1769,37 @@ function isUserReviewingOutput() {
 }
 
 function shouldAutoFollowLatest() {
+  if (isLatestFollowLocked()) return true;
   return followLatestOutput && !isUserReviewingOutput() && !terminalTouchActive;
 }
 
 function shouldStayAtBottom(forceStayAtBottom = false) {
-  return (forceStayAtBottom || followLatestOutput) && !isUserReviewingOutput() && !terminalTouchActive;
+  if (forceStayAtBottom || isLatestFollowLocked()) return true;
+  return followLatestOutput && !isUserReviewingOutput() && !terminalTouchActive;
+}
+
+function shouldHoldTerminalOutputForReview() {
+  if (isLatestFollowLocked()) return false;
+  return isUserReviewingOutput() || terminalTouchActive || !isTerminalAtBottom();
+}
+
+function pauseTerminalOutputFlush() {
+  if (outputFlushTimer) {
+    window.clearTimeout(outputFlushTimer);
+    outputFlushTimer = 0;
+  }
+  if (outputFlushHandle) {
+    window.cancelAnimationFrame(outputFlushHandle);
+    outputFlushHandle = 0;
+  }
 }
 
 function isTerminalReviewOutputPaused() {
   return isUserReviewingOutput() && Date.now() < terminalReviewOutputPausedUntil;
+}
+
+function isLatestFollowLocked() {
+  return Date.now() < latestFollowLockedUntil;
 }
 
 function captureTerminalReviewScrollTop() {
@@ -1719,6 +1929,7 @@ function scrollTerminalToBottom() {
   if (!term) return;
   suppressTerminalScrollTracking(160);
   term.scrollToBottom();
+  forceTerminalViewportToBottom();
   followLatestOutput = true;
   hasUnreadOutput = false;
   userReviewingOutput = false;
@@ -1727,12 +1938,35 @@ function scrollTerminalToBottom() {
   updateNewOutputButton();
 }
 
-function scrollTerminalToBottomSoon() {
+function forceTerminalViewportToBottom() {
+  const viewport = terminalViewport();
+  if (!viewport) return;
+  viewport.scrollTop = viewport.scrollHeight;
+}
+
+function scrollTerminalToBottomSoon(forceStayAtBottom = false) {
+  const token = terminalBottomSettleToken;
   requestAnimationFrame(() => {
-    if (shouldAutoFollowLatest()) {
+    if (token !== terminalBottomSettleToken) return;
+    if ((forceStayAtBottom || shouldAutoFollowLatest()) && !shouldHoldTerminalOutputForReview()) {
       scrollTerminalToBottom();
     }
   });
+}
+
+function scheduleTerminalBottomSettle() {
+  const token = terminalBottomSettleToken;
+  scrollTerminalToBottomSoon(true);
+  window.setTimeout(() => {
+    if (token === terminalBottomSettleToken && !shouldHoldTerminalOutputForReview()) {
+      scrollTerminalToBottomSoon(true);
+    }
+  }, 80);
+  window.setTimeout(() => {
+    if (token === terminalBottomSettleToken && !shouldHoldTerminalOutputForReview()) {
+      scrollTerminalToBottomSoon(true);
+    }
+  }, 260);
 }
 
 function suppressTerminalScrollTracking(durationMs) {
@@ -1747,6 +1981,7 @@ function isTerminalScrollTrackingSuppressed() {
 }
 
 function shouldPreserveLatestForLayout() {
+  if (isLatestFollowLocked()) return true;
   if (isUserReviewingOutput() || terminalTouchActive) return false;
   return inputFocused || Date.now() - lastInputBlurAt <= viewportLayoutSettleMs || followLatestOutput;
 }
@@ -1809,20 +2044,40 @@ function fitTerminal(forceStayAtBottom = false) {
     scheduleTerminalFitRetry(forceStayAtBottom);
     return;
   }
-  const stayAtBottom = shouldStayAtBottom(forceStayAtBottom);
+  const stayAtBottom = shouldStayAtBottom(forceStayAtBottom) && !shouldHoldTerminalOutputForReview();
   if (stayAtBottom) {
     suppressTerminalScrollTracking(viewportLayoutSettleMs);
   }
-  fitAddon.fit();
+  resizeTerminalToFit(proposed);
   terminalFitRetryCount = 0;
   window.clearTimeout(terminalFitRetryTimer);
   terminalFitRetryTimer = 0;
   refreshTerminal();
   if (stayAtBottom) {
     scrollTerminalToBottom();
-    window.setTimeout(scrollTerminalToBottomSoon, 80);
-    window.setTimeout(scrollTerminalToBottomSoon, 260);
+    scheduleTerminalBottomSettle();
   }
+}
+
+function resizeTerminalToFit(proposed) {
+  const cols = Math.max(2, Math.floor(proposed.cols));
+  const rows = Math.max(1, Math.floor(proposed.rows) - terminalFitRowSafetyMargin());
+  if (term.cols !== cols || term.rows !== rows) {
+    term.resize(cols, rows);
+  }
+  updateLayoutDebugStatus(proposed);
+}
+
+function terminalFitRowSafetyMargin() {
+  return nativeWrapperMode && isIOSLike() ? 2 : 1;
+}
+
+function updateLayoutDebugStatus(proposed = null) {
+  if (Date.now() > layoutDebugUntil || !term) return;
+  const visualHeight = Math.round(window.visualViewport?.height || window.innerHeight || 0);
+  const terminalHeight = Math.round(terminalElement.getBoundingClientRect().height || 0);
+  const proposedRows = proposed && Number.isFinite(proposed.rows) ? Math.floor(proposed.rows) : "?";
+  setStatus("connecting", restartPending ? "Restarting" : "Layout", `rows ${term.rows}/${proposedRows} · vh ${visualHeight} · term ${terminalHeight}`);
 }
 
 function scheduleTerminalFitRetry(forceStayAtBottom) {
@@ -1830,8 +2085,7 @@ function scheduleTerminalFitRetry(forceStayAtBottom) {
   terminalFitRetryCount += 1;
   terminalFitRetryTimer = window.setTimeout(() => {
     terminalFitRetryTimer = 0;
-    fitTerminal(forceStayAtBottom);
-    sendResize();
+    runTerminalLayoutPass(forceStayAtBottom, true);
   }, terminalFitRetryDelayMs);
 }
 
@@ -1850,17 +2104,19 @@ function scheduleFit(forceStayAtBottom = false) {
   resizeTimer = window.setTimeout(() => {
     const shouldPreserveLatest = preserveLatestOnScheduledFit;
     preserveLatestOnScheduledFit = false;
-    fitTerminal(shouldPreserveLatest);
-    sendResize();
+    runTerminalLayoutPass(shouldPreserveLatest, false);
   }, 120);
 }
 
-function sendResize() {
+function sendResize(options = {}) {
   if (!term || !socket || socket.readyState !== WebSocket.OPEN) return;
-  if (isKeyboardActivityRecent()) {
+  const force = options.force === true;
+  if (!force && isKeyboardActivityRecent()) {
     scheduleResizeAfterKeyboard();
     return;
   }
+  window.clearTimeout(resizeAfterKeyboardTimer);
+  resizeAfterKeyboardTimer = 0;
   const cols = term.cols;
   const rows = term.rows;
   if (cols === lastSentResizeCols && rows === lastSentResizeRows) return;
@@ -1873,8 +2129,8 @@ function scheduleResizeAfterKeyboard() {
   window.clearTimeout(resizeAfterKeyboardTimer);
   resizeAfterKeyboardTimer = window.setTimeout(() => {
     resizeAfterKeyboardTimer = 0;
-    sendResize();
-  }, Math.max(120, keyboardActivityUntil - Date.now() + 80));
+    runTerminalLayoutPass(shouldPreserveLatestForLayout(), true);
+  }, Math.max(keyboardResizeSettleMs, keyboardActivityUntil - Date.now() + 80));
 }
 
 function setStatus(kind, label, detail = "") {
@@ -1921,18 +2177,27 @@ function setStatus(kind, label, detail = "") {
 }
 
 function bytesToBase64(bytes) {
+  if (typeof bytes.toBase64 === "function") {
+    return bytes.toBase64();
+  }
   const chunkSize = 0x8000;
   let binary = "";
   for (let index = 0; index < bytes.length; index += chunkSize) {
-    const chunk = bytes.subarray(index, index + chunkSize);
-    for (let offset = 0; offset < chunk.length; offset += 1) {
-      binary += String.fromCharCode(chunk[offset]);
-    }
+    // Build each block in one call instead of appending char-by-char (which is
+    // quadratic for large inputs). chunkSize stays well under the argument limit.
+    binary += String.fromCharCode.apply(null, bytes.subarray(index, index + chunkSize));
   }
   return btoa(binary);
 }
 
 function base64ToBytes(value) {
+  if (hasNativeFromBase64) {
+    try {
+      return Uint8Array.fromBase64(value);
+    } catch {
+      // Fall through to manual decode on unexpected input.
+    }
+  }
   const binary = atob(value);
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) {
@@ -1946,16 +2211,38 @@ function refreshApp() {
   refreshButton.textContent = "Refreshing";
   setStatus(connected ? "connected" : "connecting", connected ? "Connected" : "Refreshing", "Updating app");
 
-  const reload = () => window.location.reload();
-  if (!("serviceWorker" in navigator)) {
-    reload();
-    return;
+  hardReloadApp();
+}
+
+async function hardReloadApp() {
+  try {
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(key => caches.delete(key)));
+    }
+  } catch {
+    // Continue with a network reload even if Cache Storage is unavailable.
   }
 
-  navigator.serviceWorker.ready
-    .then(registration => registration.update())
-    .catch(() => {})
-    .finally(reload);
+  try {
+    if ("serviceWorker" in navigator) {
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(registrations.map(async registration => {
+        try {
+          await registration.update();
+        } catch {
+          // Some iOS builds reject update() during navigation; unregister still helps.
+        }
+        return registration.unregister();
+      }));
+    }
+  } catch {
+    // Fall through to a cache-busted reload.
+  }
+
+  const url = new URL(window.location.href);
+  url.searchParams.set("appRefresh", String(Date.now()));
+  window.location.replace(url.href);
 }
 
 function checkForAppUpdate() {

@@ -26,8 +26,10 @@ html,
 body {
   width: 100%;
   height: 100%;
+  height: 100dvh;
   min-width: 100%;
   min-height: 100%;
+  min-height: 100dvh;
   margin: 0;
   background: var(--bg);
   color: var(--text);
@@ -61,6 +63,7 @@ button {
   left: calc(var(--app-left) + var(--app-gutter));
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
+  min-height: 0;
   height: var(--app-height);
   width: min(var(--app-width), 980px);
   max-width: 100vw;
@@ -101,7 +104,8 @@ html[data-native-wrapper="1"] .path-overlay {
 }
 
 html[data-native-wrapper="1"] .terminal-wrap {
-  min-height: 100vh;
+  min-height: 0;
+  height: 100%;
 }
 
 html[data-native-wrapper="1"] .terminal {
@@ -264,20 +268,34 @@ html[data-native-wrapper="1"] .terminal {
 .terminal-wrap {
   position: relative;
   min-height: 0;
+  max-height: 100%;
   overflow: hidden;
   overscroll-behavior: none;
   background: #090c10;
   touch-action: pan-y;
+  contain: layout paint;
 }
 
 .terminal {
   width: 100%;
   height: 100%;
+  min-height: 0;
   padding: 12px;
+  overflow: hidden;
+  will-change: contents;
+  contain: strict;
 }
 
 .terminal .xterm {
+  width: 100%;
   height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.terminal .xterm-screen {
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .terminal .xterm-viewport {
@@ -285,6 +303,11 @@ html[data-native-wrapper="1"] .terminal {
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: none;
   touch-action: pan-y;
+  will-change: scroll-position;
+}
+
+.terminal .xterm-screen canvas {
+  max-width: 100%;
 }
 
 .terminal .xterm-helper-textarea {
@@ -309,6 +332,11 @@ html[data-native-wrapper="1"] .terminal {
   font-size: 13px;
   font-weight: 800;
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.36);
+  cursor: pointer;
+  pointer-events: auto;
+  touch-action: manipulation;
+  z-index: 20;
+  contain: layout paint style;
 }
 
 .restore-overlay {
@@ -333,6 +361,7 @@ html[data-native-wrapper="1"] .terminal {
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.28);
   pointer-events: none;
   z-index: 2;
+  contain: layout paint style;
 }
 
 .path-overlay {
@@ -359,6 +388,7 @@ html[data-native-wrapper="1"] .terminal {
   text-overflow: ellipsis;
   white-space: nowrap;
   z-index: 2;
+  contain: layout paint style;
 }
 
 .path-overlay[hidden] {

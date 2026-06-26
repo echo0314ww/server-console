@@ -1,15 +1,17 @@
-const CACHE_NAME = "server-console-v70";
+const CACHE_NAME = "server-console-v88";
 const cachePromise = caches.open(CACHE_NAME);
 const ASSETS = [
   "/",
   "/index.html",
-  "/styles.css?v=70",
-  "/app.js?v=70",
-  "/manifest.webmanifest?v=70",
+  "/styles.css?v=88",
+  "/app.js?v=88",
+  "/manifest.webmanifest?v=88",
   "/icons/icon.svg",
   "/vendor/xterm/xterm.min.css",
   "/vendor/xterm/xterm.min.js",
-  "/vendor/xterm/addon-fit.min.js"
+  "/vendor/xterm/addon-fit.min.js",
+  "/vendor/xterm/addon-canvas.min.js",
+  "/vendor/xterm/addon-webgl.min.js"
 ];
 
 self.addEventListener("install", event => {
@@ -78,5 +80,7 @@ function isStaticAsset(pathname) {
     pathname === "/icons/icon.svg" ||
     pathname === "/vendor/xterm/xterm.min.css" ||
     pathname === "/vendor/xterm/xterm.min.js" ||
-    pathname === "/vendor/xterm/addon-fit.min.js";
+    pathname === "/vendor/xterm/addon-fit.min.js" ||
+    pathname === "/vendor/xterm/addon-canvas.min.js" ||
+    pathname === "/vendor/xterm/addon-webgl.min.js";
 }

@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import base64
 import binascii
+import gzip
 import hashlib
 import hmac
 import json
@@ -51,18 +52,32 @@ SESSION_REPLAY_BYTES = 32 * 1024
 PTY_READ_CHUNK_BYTES = 32 * 1024
 SESSION_IDLE_TIMEOUT_SECONDS = 12 * 60 * 60
 CWD_POLL_INTERVAL_SECONDS = 1.0
+CWD_POLL_MAX_INTERVAL_SECONDS = 5.0
 CWD_POLL_TIMEOUT_SECONDS = 0.5
 ATTACHED_WRITER_CLOSE_TIMEOUT_SECONDS = 1.0
 WEBSOCKET_DRAIN_TIMEOUT_SECONDS = 5.0
 HTTP_REQUEST_READ_TIMEOUT_SECONDS = 10.0
+MAX_KEEPALIVE_REQUESTS = 64
 PTY_WRITE_TIMEOUT_SECONDS = 10.0
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(ROOT_DIR, "web")
 WEB_ROOT = os.path.abspath(WEB_DIR)
 SESSION_ID_ALLOWED_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
-INPUT_MESSAGE_PREFIX = b'{"type":"input","data":"'
-INPUT_MESSAGE_SUFFIX = b'"}'
-STATIC_FILE_CACHE: dict[str, tuple[int, int, bytes, str]] = {}
+# Binary WebSocket data frames (opcode 0x2) carry terminal bytes without base64,
+# avoiding base64's ~33% inflation and the per-chunk encode/decode cost on both
+# ends. Control messages (hello/cwd/exit/error/pong) stay JSON text frames.
+#   server -> client output: [0x00][uint32 big-endian sequence][raw pty bytes]
+#   client -> server input:  [0x00][raw input bytes]
+BINARY_TYPE_DATA = 0x00
+BINARY_TYPE_DATA_BYTE = b"\x00"
+GZIPPABLE_TYPES = (
+    "text/",
+    "application/javascript",
+    "application/json",
+    "application/manifest+json",
+    "image/svg+xml",
+)
+STATIC_FILE_CACHE: dict[str, tuple[int, int, bytes, str, Optional[bytes]]] = {}
 
 
 @dataclass(slots=True)
@@ -247,19 +262,29 @@ async def send_http_response(
     message: str,
     body: bytes,
     content_type: str,
+    content_encoding: Optional[str] = None,
+    cache_control: str = "no-cache",
+    vary_accept_encoding: bool = False,
+    keep_alive: bool = False,
 ) -> None:
+    encoding_header = f"Content-Encoding: {content_encoding}\r\n" if content_encoding else ""
+    vary_header = "Vary: Accept-Encoding\r\n" if vary_accept_encoding else ""
+    connection_header = "Connection: keep-alive\r\n" if keep_alive else "Connection: close\r\n"
     writer.write(
         f"HTTP/1.1 {code} {message}\r\n"
         f"Content-Length: {len(body)}\r\n"
         f"Content-Type: {content_type}\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Connection: close\r\n"
+        f"{encoding_header}"
+        f"{vary_header}"
+        f"Cache-Control: {cache_control}\r\n"
+        f"{connection_header}"
         "\r\n".encode("ascii")
         + body
     )
     await writer.drain()
-    writer.close()
-    await writer.wait_closed()
+    if not keep_alive:
+        writer.close()
+        await writer.wait_closed()
 
 
 def request_path(request_line: str) -> str:
@@ -267,6 +292,18 @@ def request_path(request_line: str) -> str:
     if len(parts) < 2 or parts[0].upper() != "GET":
         raise HttpRequestError("Only GET is supported.")
     return urllib.parse.urlparse(parts[1]).path
+
+
+def request_wants_close(request_line: str, headers: dict[str, str]) -> bool:
+    # HTTP/1.0 defaults to close unless it explicitly opts into keep-alive;
+    # HTTP/1.1 defaults to keep-alive unless it asks to close.
+    connection = headers.get("connection", "").lower()
+    if "close" in connection:
+        return True
+    version = request_line.rsplit(" ", 1)[-1].strip().upper() if request_line else ""
+    if version == "HTTP/1.0":
+        return "keep-alive" not in connection
+    return False
 
 
 def static_file_for_path(path: str) -> Optional[str]:
@@ -281,35 +318,148 @@ def static_file_for_path(path: str) -> Optional[str]:
     return full_path
 
 
-async def serve_static_file(writer: asyncio.StreamWriter, path: str) -> None:
+def static_file_exists(full_path: Optional[str]) -> bool:
+    if not full_path:
+        return False
+    try:
+        stat_result = os.stat(full_path)
+    except OSError:
+        return False
+    return stat.S_ISREG(stat_result.st_mode)
+
+
+def accepts_gzip(accept_encoding: str) -> bool:
+    wildcard_quality = 0.0
+    for value in accept_encoding.split(","):
+        parts = [part.strip().lower() for part in value.split(";")]
+        if not parts or not parts[0]:
+            continue
+        quality = 1.0
+        for parameter in parts[1:]:
+            key, separator, raw_value = parameter.partition("=")
+            if key.strip() == "q" and separator:
+                try:
+                    quality = float(raw_value.strip())
+                except ValueError:
+                    quality = 0.0
+        if parts[0] == "gzip":
+            return quality > 0
+        if parts[0] == "*":
+            wildcard_quality = quality
+    return wildcard_quality > 0
+
+
+def is_gzippable_content_type(content_type: str) -> bool:
+    return content_type.startswith(GZIPPABLE_TYPES)
+
+
+def cache_control_for_path(path: str) -> str:
+    if path == "/" or path == "/index.html":
+        return "no-cache"
+    return "public, max-age=31536000, immutable"
+
+
+def static_content_type(full_path: str) -> str:
+    content_type = mimetypes.guess_type(full_path)[0] or "application/octet-stream"
+    if full_path.endswith(".webmanifest"):
+        content_type = "application/manifest+json"
+    return content_type
+
+
+def prewarm_static_cache() -> None:
+    # Populate STATIC_FILE_CACHE (and precompute gzip for eligible files) at
+    # startup so the first request for a large asset like xterm.min.js (~283KB)
+    # does not pay read + level-9 compress latency on the event loop, which would
+    # otherwise stall every connection during that window. Best-effort: unreadable
+    # files are simply left to the lazy path in serve_static_file().
+    for dirpath, _dirnames, filenames in os.walk(WEB_DIR):
+        for filename in filenames:
+            full_path = os.path.join(dirpath, filename)
+            try:
+                stat_result = os.stat(full_path)
+                if not stat.S_ISREG(stat_result.st_mode):
+                    continue
+                with open(full_path, "rb") as file:
+                    body = file.read()
+            except OSError:
+                continue
+            content_type = static_content_type(full_path)
+            gzipped_body = None
+            if len(body) >= 1024 and is_gzippable_content_type(content_type):
+                gzipped_body = gzip.compress(body)
+            STATIC_FILE_CACHE[full_path] = (
+                stat_result.st_mtime_ns,
+                stat_result.st_size,
+                body,
+                content_type,
+                gzipped_body,
+            )
+
+
+async def serve_static_file(
+    writer: asyncio.StreamWriter,
+    path: str,
+    accept_encoding: str = "",
+    keep_alive: bool = False,
+) -> bool:
     full_path = static_file_for_path(path)
     if not full_path:
         await send_http_error(writer, 404, "Not Found")
-        return
+        return False
 
     try:
         stat_result = os.stat(full_path)
     except OSError:
         await send_http_error(writer, 404, "Not Found")
-        return
+        return False
     if not stat.S_ISREG(stat_result.st_mode):
         await send_http_error(writer, 404, "Not Found")
-        return
+        return False
 
     cache_key = full_path
     cached = STATIC_FILE_CACHE.get(cache_key)
     if cached and cached[0] == stat_result.st_mtime_ns and cached[1] == stat_result.st_size:
         body = cached[2]
         content_type = cached[3]
+        gzipped_body = cached[4]
     else:
         with open(full_path, "rb") as file:
             body = file.read()
 
-        content_type = mimetypes.guess_type(full_path)[0] or "application/octet-stream"
-        if full_path.endswith(".webmanifest"):
-            content_type = "application/manifest+json"
-        STATIC_FILE_CACHE[cache_key] = (stat_result.st_mtime_ns, stat_result.st_size, body, content_type)
-    await send_http_response(writer, 200, "OK", body, content_type)
+        content_type = static_content_type(full_path)
+        gzipped_body = None
+        STATIC_FILE_CACHE[cache_key] = (stat_result.st_mtime_ns, stat_result.st_size, body, content_type, gzipped_body)
+
+    response_body = body
+    content_encoding = None
+    can_gzip = len(body) >= 1024 and is_gzippable_content_type(content_type)
+    if accepts_gzip(accept_encoding) and can_gzip:
+        if gzipped_body is None:
+            # Compress off the event loop so a cache-miss on a large asset does
+            # not block other connections; startup prewarm covers the common case.
+            gzipped_body = await asyncio.to_thread(gzip.compress, body)
+            STATIC_FILE_CACHE[cache_key] = (
+                stat_result.st_mtime_ns,
+                stat_result.st_size,
+                body,
+                content_type,
+                gzipped_body,
+            )
+        response_body = gzipped_body
+        content_encoding = "gzip"
+
+    await send_http_response(
+        writer,
+        200,
+        "OK",
+        response_body,
+        content_type,
+        content_encoding=content_encoding,
+        cache_control=cache_control_for_path(path),
+        vary_accept_encoding=can_gzip,
+        keep_alive=keep_alive,
+    )
+    return keep_alive
 
 
 async def complete_handshake(
@@ -376,7 +526,7 @@ class WebSocketFrameReader:
                     return None
                 return opcode, payload
 
-            if opcode == 0x1:
+            if opcode in (0x1, 0x2):
                 if self.fragment_opcode is not None:
                     raise WebSocketProtocolError("new data frame before fragmented message completed")
                 if fin:
@@ -432,14 +582,6 @@ class WebSocketFrameReader:
         return fin, opcode, payload
 
 
-async def read_ws_frame(reader: asyncio.StreamReader) -> Optional[tuple[int, bytes]]:
-    frame_reader = getattr(reader, "_server_console_ws_frame_reader", None)
-    if frame_reader is None:
-        frame_reader = WebSocketFrameReader(reader)
-        setattr(reader, "_server_console_ws_frame_reader", frame_reader)
-    return await frame_reader.read()
-
-
 def unmask_ws_payload(payload: bytes, mask: bytes) -> bytes:
     if not payload:
         return payload
@@ -451,12 +593,11 @@ def unmask_ws_payload(payload: bytes, mask: bytes) -> bytes:
     ).to_bytes(length, "big")
 
 
-def decode_fast_input_payload(payload: bytes) -> tuple[bool, bytes]:
-    if not payload.startswith(INPUT_MESSAGE_PREFIX) or not payload.endswith(INPUT_MESSAGE_SUFFIX):
+def decode_binary_input_payload(payload: bytes) -> tuple[bool, bytes]:
+    # Binary input frames are [0x00][raw bytes]; return the raw terminal bytes.
+    if not payload or payload[0] != BINARY_TYPE_DATA:
         return False, b""
-
-    encoded = payload[len(INPUT_MESSAGE_PREFIX):-len(INPUT_MESSAGE_SUFFIX)]
-    return True, base64.b64decode(encoded, validate=True)
+    return True, payload[1:]
 
 
 async def send_ws_frame(writer: asyncio.StreamWriter, payload: bytes, opcode: int = 0x1) -> None:
@@ -482,9 +623,18 @@ def encode_ws_frame(payload: bytes, opcode: int = 0x1) -> bytes:
     return header + payload
 
 
+async def _drain_if_buffered(writer: asyncio.StreamWriter) -> None:
+    # Avoid per-frame wait_for() overhead when the transport has already accepted
+    # the data; retain timeout backpressure when a slow client builds a buffer.
+    transport = writer.transport
+    if transport is None or transport.get_write_buffer_size() == 0:
+        return
+    await asyncio.wait_for(writer.drain(), timeout=WEBSOCKET_DRAIN_TIMEOUT_SECONDS)
+
+
 async def send_preencoded_ws_frame(writer: asyncio.StreamWriter, frame: bytes) -> None:
     writer.write(frame)
-    await asyncio.wait_for(writer.drain(), timeout=WEBSOCKET_DRAIN_TIMEOUT_SECONDS)
+    await _drain_if_buffered(writer)
 
 
 async def send_preencoded_ws_frames(writer: asyncio.StreamWriter, frames: list[bytes]) -> None:
@@ -492,7 +642,7 @@ async def send_preencoded_ws_frames(writer: asyncio.StreamWriter, frames: list[b
         return
     for frame in frames:
         writer.write(frame)
-    await asyncio.wait_for(writer.drain(), timeout=WEBSOCKET_DRAIN_TIMEOUT_SECONDS)
+    await _drain_if_buffered(writer)
 
 
 def encode_json_frame(payload: dict) -> bytes:
@@ -503,24 +653,12 @@ async def send_json(writer: asyncio.StreamWriter, payload: dict) -> None:
     await send_preencoded_ws_frame(writer, encode_json_frame(payload))
 
 
-def encode_pty_output_payload(data: bytes, sequence: Optional[int] = None) -> bytes:
-    if sequence is not None:
-        return (
-            b'{"type":"output","data":"'
-            + base64.b64encode(data)
-            + b'","seq":'
-            + str(sequence).encode("ascii")
-            + b"}"
-        )
-    return b'{"type":"output","data":"' + base64.b64encode(data) + b'"}'
-
-
 def encode_pty_output_frame(data: bytes, sequence: Optional[int] = None) -> bytes:
-    return encode_ws_frame(encode_pty_output_payload(data, sequence))
-
-
-async def send_pty_output(writer: asyncio.StreamWriter, data: bytes, sequence: Optional[int] = None) -> None:
-    await send_preencoded_ws_frame(writer, encode_pty_output_frame(data, sequence))
+    # Binary data frame: [0x00][uint32 BE sequence][raw bytes]. The sequence lets
+    # the client de-duplicate replayed chunks on reconnect; 0 means "unsequenced".
+    seq = (sequence or 0) & 0xFFFFFFFF
+    payload = BINARY_TYPE_DATA_BYTE + struct.pack("!I", seq) + data
+    return encode_ws_frame(payload, opcode=0x2)
 
 
 async def close_stream_writer(writer: asyncio.StreamWriter) -> None:
@@ -541,19 +679,22 @@ def set_pty_size(fd: int, rows: int, cols: int) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, packed)
 
 
-def spawn_shell(config: GatewayConfig) -> tuple[int, int]:
+def spawn_shell(config: GatewayConfig, cols: Optional[int] = None, rows: Optional[int] = None) -> tuple[int, int]:
     if pty is None:
         raise RuntimeError("PTY mode requires a Unix-like server.")
 
     login_banner = build_login_banner()
     args = login_shell_args(config.shell)
     home_dir = shell_start_directory()
+    initial_cols = cols or config.cols
+    initial_rows = rows or config.rows
 
     pid, fd = pty.fork()
 
     if pid == 0:
         os.environ.setdefault("TERM", "xterm-256color")
         os.environ.setdefault("COLORTERM", "truecolor")
+        set_pty_size(1, rows=initial_rows, cols=initial_cols)
 
         try:
             os.chdir(home_dir)
@@ -565,7 +706,7 @@ def spawn_shell(config: GatewayConfig) -> tuple[int, int]:
 
         os.execvp(args[0], args)
 
-    set_pty_size(fd, config.rows, config.cols)
+    set_pty_size(fd, initial_rows, initial_cols)
     os.set_blocking(fd, False)
     return pid, fd
 
@@ -739,32 +880,6 @@ def current_user_name() -> str:
         return os.environ.get("USER", "root")
 
 
-async def pty_to_socket(
-    writer: asyncio.StreamWriter,
-    fd: int,
-    pid: int,
-    stop: asyncio.Event,
-) -> None:
-    while not stop.is_set():
-        try:
-            data = read_pty_once(fd)
-        except OSError:
-            data = b""
-
-        if data:
-            await send_pty_output(writer, data)
-            continue
-
-        exit_code = child_exit_code(pid)
-        if exit_code is not None:
-            await drain_pty_output(writer, fd)
-            await send_json(writer, {"type": "exit", "code": exit_code})
-            stop.set()
-            break
-
-        await wait_for_fd_readable(fd)
-
-
 def read_pty_once(fd: int) -> bytes:
     try:
         return os.read(fd, PTY_READ_CHUNK_BYTES)
@@ -772,23 +887,33 @@ def read_pty_once(fd: int) -> bytes:
         return b""
 
 
-async def drain_pty_output(writer: asyncio.StreamWriter, fd: int, idle_reads: int = 3) -> None:
-    empty_reads = 0
+def read_pty_some(fd: int, max_bytes: int) -> bytes:
+    try:
+        return os.read(fd, max_bytes)
+    except BlockingIOError:
+        return b""
 
-    while empty_reads < idle_reads:
+
+def read_pty_burst(fd: int, cap: int) -> bytes:
+    # Concatenate consecutive immediately-available reads into one chunk, never
+    # exceeding `cap` bytes. Never blocks: stops as soon as a read yields nothing.
+    # `cap` MUST be <= SESSION_OUTPUT_BUFFER_BYTES so the chunk survives
+    # _trim_output_buffer() and stays available for replay.
+    first = read_pty_once(fd)
+    if not first:
+        return first
+    parts = [first]
+    total = len(first)
+    while total < cap:
         try:
-            data = read_pty_once(fd)
+            more = read_pty_some(fd, cap - total)
         except OSError:
             break
-
-        if data:
-            empty_reads = 0
-            await send_pty_output(writer, data)
-            continue
-
-        empty_reads += 1
-        if empty_reads < idle_reads:
-            await asyncio.sleep(0.01)
+        if not more:
+            break
+        parts.append(more)
+        total += len(more)
+    return parts[0] if len(parts) == 1 else b"".join(parts)
 
 
 def child_exit_code(pid: int) -> Optional[int]:
@@ -858,14 +983,19 @@ async def write_all(fd: int, data: bytes) -> None:
 
 
 class PersistentSession:
-    def __init__(self, session_id: str, config: GatewayConfig) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        config: GatewayConfig,
+        cols: Optional[int] = None,
+        rows: Optional[int] = None,
+    ) -> None:
         self.session_id = session_id
         self.config = config
-        self.pid, self.fd = spawn_shell(config)
-        self.cols = config.cols
-        self.rows = config.rows
+        self.cols = cols or config.cols
+        self.rows = rows or config.rows
+        self.pid, self.fd = spawn_shell(config, cols=self.cols, rows=self.rows)
         self.created_at = time.time()
-        self.last_attach_at = 0.0
         self.last_detach_at = self.created_at
         self.exit_code: Optional[int] = None
         self.closed = False
@@ -878,6 +1008,7 @@ class PersistentSession:
         self.cwd_polling_active = asyncio.Event()
         self.cwd_probe_task: Optional[asyncio.Task[str]] = None
         self.attachments: dict[asyncio.StreamWriter, SessionWriter] = {}
+        self.ready_attachment_snapshot: Optional[list[tuple[asyncio.StreamWriter, SessionWriter]]] = None
         self.attach_lock = asyncio.Lock()
         self.reader_task = asyncio.create_task(self._reader_loop())
         self.cwd_task = asyncio.create_task(self._cwd_loop())
@@ -897,9 +1028,9 @@ class PersistentSession:
             exit_code = self.exit_code
             session_writer = SessionWriter(lock=asyncio.Lock())
             self.attachments[writer] = session_writer
+            self._invalidate_attachment_snapshot()
             if not refresh_cwd:
                 self.cwd_polling_active.set()
-            self.last_attach_at = time.time()
 
         if refresh_cwd:
             cwd = await self._probe_current_cwd()
@@ -953,6 +1084,7 @@ class PersistentSession:
     def detach(self, writer: asyncio.StreamWriter) -> None:
         if writer in self.attachments:
             del self.attachments[writer]
+            self._invalidate_attachment_snapshot()
             if not self.attachments:
                 self.last_detach_at = time.time()
                 self.cwd_polling_active.clear()
@@ -960,11 +1092,24 @@ class PersistentSession:
     def _is_attached(self, writer: asyncio.StreamWriter, session_writer: SessionWriter) -> bool:
         return self.attachments.get(writer) is session_writer
 
-    def _attachment_snapshot(self, ready_only: bool = True) -> list[tuple[asyncio.StreamWriter, SessionWriter]]:
-        attachments = list(self.attachments.items())
-        if ready_only:
-            return [(writer, session_writer) for writer, session_writer in attachments if session_writer.ready]
-        return attachments
+    def _invalidate_attachment_snapshot(self) -> None:
+        self.ready_attachment_snapshot = None
+
+    def _mark_attachment_ready(self, session_writer: SessionWriter) -> None:
+        if not session_writer.ready:
+            session_writer.ready = True
+            self._invalidate_attachment_snapshot()
+
+    def _ready_attachment_snapshot(self) -> list[tuple[asyncio.StreamWriter, SessionWriter]]:
+        snapshot = self.ready_attachment_snapshot
+        if snapshot is None:
+            snapshot = [
+                (writer, session_writer)
+                for writer, session_writer in self.attachments.items()
+                if session_writer.ready
+            ]
+            self.ready_attachment_snapshot = snapshot
+        return snapshot
 
     def _detach_failed_writers(
         self,
@@ -1040,13 +1185,14 @@ class PersistentSession:
             return
 
         self.attachments.clear()
+        self._invalidate_attachment_snapshot()
         self.last_detach_at = time.time()
         await asyncio.gather(*(close_stream_writer(writer) for writer in writers), return_exceptions=True)
 
     async def _reader_loop(self) -> None:
         while not self.closed:
             try:
-                data = read_pty_once(self.fd)
+                data = read_pty_burst(self.fd, SESSION_OUTPUT_BUFFER_BYTES)
             except OSError:
                 data = b""
 
@@ -1070,13 +1216,17 @@ class PersistentSession:
     async def _cwd_loop(self) -> None:
         while not self.closed:
             await self.cwd_polling_active.wait()
+            interval = CWD_POLL_INTERVAL_SECONDS
             while not self.closed and self.cwd_polling_active.is_set():
                 cwd = await self._probe_current_cwd()
                 if cwd != self.current_cwd:
                     self.current_cwd = cwd
+                    interval = CWD_POLL_INTERVAL_SECONDS
                     if cwd:
                         await self._send_cwd_to_attached(cwd)
-                await asyncio.sleep(CWD_POLL_INTERVAL_SECONDS)
+                else:
+                    interval = min(interval * 1.5, CWD_POLL_MAX_INTERVAL_SECONDS)
+                await asyncio.sleep(interval)
 
     async def _probe_current_cwd(self) -> str:
         task = self.cwd_probe_task
@@ -1095,7 +1245,7 @@ class PersistentSession:
 
         while empty_reads < idle_reads:
             try:
-                data = read_pty_once(self.fd)
+                data = read_pty_burst(self.fd, SESSION_OUTPUT_BUFFER_BYTES)
             except OSError:
                 break
             if data:
@@ -1156,11 +1306,11 @@ class PersistentSession:
             if self.exit_code is not None:
                 if not exit_sent:
                     await send_preencoded_ws_frame(writer, encode_json_frame({"type": "exit", "code": self.exit_code}))
-                session_writer.ready = True
+                self._mark_attachment_ready(session_writer)
                 return
 
             if last_sequence >= self.output_sequence:
-                session_writer.ready = True
+                self._mark_attachment_ready(session_writer)
                 return
 
             last_sequence = self.output_sequence
@@ -1181,7 +1331,7 @@ class PersistentSession:
         await self._broadcast_frame(encode_json_frame({"type": "exit", "code": exit_code}))
 
     async def _broadcast_frame(self, frame: bytes) -> None:
-        attachments = self._attachment_snapshot()
+        attachments = self._ready_attachment_snapshot()
         if not attachments:
             return
         if len(attachments) == 1:
@@ -1262,20 +1412,19 @@ class SessionManager:
             await old_session.close()
         return session
 
-    async def close_session(self, session_id: str) -> None:
-        async with self.lock:
-            session = self.sessions.pop(session_id, None)
-        if session:
-            await session.close()
-
-    async def restart_session(self, session_id: str) -> PersistentSession:
+    async def restart_session(
+        self,
+        session_id: str,
+        cols: Optional[int] = None,
+        rows: Optional[int] = None,
+    ) -> PersistentSession:
         async with self.lock:
             old_session = self.sessions.pop(session_id, None)
 
         if old_session is not None:
             await old_session.close()
 
-        session = PersistentSession(session_id, self.config)
+        session = PersistentSession(session_id, self.config, cols=cols, rows=rows)
         async with self.lock:
             replaced_session = self.sessions.get(session_id)
             self.sessions[session_id] = session
@@ -1307,74 +1456,6 @@ class SessionAttachment:
     session: PersistentSession
 
 
-async def socket_to_pty(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
-    fd: int,
-    stop: asyncio.Event,
-) -> None:
-    ws_reader = WebSocketFrameReader(reader)
-    while not stop.is_set():
-        frame = await ws_reader.read()
-        if frame is None:
-            stop.set()
-            break
-
-        opcode, payload = frame
-        if opcode == 0x9:
-            await send_ws_frame(writer, payload, opcode=0xA)
-            continue
-
-        try:
-            matched_input, data = decode_fast_input_payload(payload)
-        except binascii.Error:
-            await send_json(writer, {"type": "error", "message": "invalid base64 input"})
-            continue
-        if matched_input:
-            try:
-                await write_all(fd, data)
-            except OSError:
-                await send_json(writer, {"type": "error", "message": "PTY input failed"})
-                stop.set()
-                break
-            continue
-
-        try:
-            message = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            await send_json(writer, {"type": "error", "message": "invalid JSON message"})
-            continue
-
-        message_type = message.get("type")
-        if message_type == "input":
-            try:
-                data = base64.b64decode(message.get("data", ""), validate=True)
-            except (binascii.Error, TypeError):
-                await send_json(writer, {"type": "error", "message": "invalid base64 input"})
-                continue
-            try:
-                await write_all(fd, data)
-            except OSError:
-                await send_json(writer, {"type": "error", "message": "PTY input failed"})
-                stop.set()
-                break
-        elif message_type == "resize":
-            try:
-                cols, rows = parse_resize(message)
-            except WebSocketProtocolError as exc:
-                await send_json(writer, {"type": "error", "message": str(exc)})
-                continue
-            set_pty_size(fd, rows=max(rows, 10), cols=max(cols, 20))
-        elif message_type == "ping":
-            await send_json(writer, {"type": "pong", "time": time.time()})
-        elif message_type == "restart":
-            await send_demo_text(writer, "[demo] restarting terminal\n")
-            stop.set()
-            break
-        else:
-            await send_json(writer, {"type": "error", "message": f"unknown message type: {message_type}"})
-
-
 async def socket_to_persistent_session(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -1395,18 +1476,15 @@ async def socket_to_persistent_session(
             await send_ws_frame(writer, payload, opcode=0xA)
             continue
 
-        try:
-            matched_input, data = decode_fast_input_payload(payload)
-        except binascii.Error:
-            await send_json(writer, {"type": "error", "message": "invalid base64 input"})
-            continue
-        if matched_input:
-            try:
-                await session.write_input(data)
-            except OSError:
-                await send_json(writer, {"type": "error", "message": "PTY input failed"})
-                stop.set()
-                break
+        if opcode == 0x2:
+            matched_input, data = decode_binary_input_payload(payload)
+            if matched_input:
+                try:
+                    await session.write_input(data)
+                except OSError:
+                    await send_json(writer, {"type": "error", "message": "PTY input failed"})
+                    stop.set()
+                    break
             continue
 
         try:
@@ -1444,9 +1522,13 @@ async def socket_to_persistent_session(
         elif message_type == "restart":
             session_id = session.session_id
             peer = writer.get_extra_info("peername")
+            try:
+                cols, rows = parse_resize(message)
+            except WebSocketProtocolError:
+                cols, rows = session.config.cols, session.config.rows
             session.detach(writer)
             try:
-                new_session = await session_manager.restart_session(session_id)
+                new_session = await session_manager.restart_session(session_id, cols=cols, rows=rows)
             except (OSError, RuntimeError) as exc:
                 await session.attach(writer, peer)
                 await send_json(writer, {"type": "error", "message": f"restart failed: {exc}"})
@@ -1503,13 +1585,10 @@ async def demo_socket_loop(
             await send_ws_frame(writer, payload, opcode=0xA)
             continue
 
-        try:
-            matched_input, data = decode_fast_input_payload(payload)
-        except binascii.Error:
-            await send_json(writer, {"type": "error", "message": "invalid base64 input"})
-            continue
-        if matched_input:
-            await send_demo_command_output(writer, data)
+        if opcode == 0x2:
+            matched_input, data = decode_binary_input_payload(payload)
+            if matched_input:
+                await send_demo_command_output(writer, data)
             continue
 
         try:
@@ -1620,7 +1699,10 @@ async def handle_demo_session(
         for task in pending:
             task.cancel()
         for task in done:
-            task.result()
+            try:
+                task.result()
+            except (WebSocketProtocolError, asyncio.IncompleteReadError, ConnectionError, OSError):
+                pass
     finally:
         stop.set()
         writer.close()
@@ -1637,46 +1719,71 @@ async def handle_client(
     session_manager: Optional[SessionManager],
 ) -> None:
     peer = writer.get_extra_info("peername")
+    requests_served = 0
 
     try:
-        request_line, headers = await read_http_request(reader)
-        path = request_path(request_line)
-    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, HttpRequestError, asyncio.TimeoutError):
-        await send_http_error(writer, 400, "Bad Request")
-        return
+        while True:
+            try:
+                request_line, headers = await read_http_request(reader)
+                path = request_path(request_line)
+            except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, HttpRequestError, asyncio.TimeoutError):
+                if requests_served > 0:
+                    return
+                await send_http_error(writer, 400, "Bad Request")
+                return
 
-    if path != "/terminal":
-        await serve_static_file(writer, path)
-        return
+            if path != "/terminal":
+                requests_served += 1
+                full_path = static_file_for_path(path)
+                keep_alive = (
+                    static_file_exists(full_path)
+                    and not request_wants_close(request_line, headers)
+                    and requests_served < MAX_KEEPALIVE_REQUESTS
+                )
+                can_continue = await serve_static_file(
+                    writer,
+                    path,
+                    headers.get("accept-encoding", ""),
+                    keep_alive=keep_alive,
+                )
+                if can_continue:
+                    continue
+                return
 
-    if not await complete_handshake(writer, config, request_line, headers):
-        return
+            if not await complete_handshake(writer, config, request_line, headers):
+                return
 
-    if config.mode == "demo":
-        await handle_demo_session(reader, writer, config, peer)
-        return
+            if config.mode == "demo":
+                await handle_demo_session(reader, writer, config, peer)
+                return
 
-    stop = asyncio.Event()
-    session_id = session_id_from_request(request_line)
-    if session_manager is None:
-        await send_json(writer, {"type": "error", "message": "session manager unavailable"})
-        writer.close()
-        await writer.wait_closed()
-        return
+            stop = asyncio.Event()
+            session_id = session_id_from_request(request_line)
+            if session_manager is None:
+                await send_json(writer, {"type": "error", "message": "session manager unavailable"})
+                return
 
-    try:
-        session = await session_manager.get(session_id)
-        attachment = SessionAttachment(session)
-        await session.attach(writer, peer)
-        await socket_to_persistent_session(reader, writer, attachment, session_manager, stop)
-    except SessionAttachError as exc:
-        await send_json(writer, {"type": "error", "message": str(exc)})
-    except (WebSocketProtocolError, asyncio.TimeoutError, ConnectionError, OSError, asyncio.IncompleteReadError) as exc:
-        print(f"client {peer} disconnected: {exc}")
+            try:
+                session = await session_manager.get(session_id)
+                attachment = SessionAttachment(session)
+                await session.attach(writer, peer)
+                await socket_to_persistent_session(reader, writer, attachment, session_manager, stop)
+            except SessionAttachError as exc:
+                await send_json(writer, {"type": "error", "message": str(exc)})
+            except (
+                WebSocketProtocolError,
+                asyncio.TimeoutError,
+                ConnectionError,
+                OSError,
+                asyncio.IncompleteReadError,
+            ) as exc:
+                print(f"client {peer} disconnected: {exc}")
+            finally:
+                stop.set()
+                if "attachment" in locals():
+                    attachment.session.detach(writer)
+            return
     finally:
-        stop.set()
-        if "attachment" in locals():
-            attachment.session.detach(writer)
         writer.close()
         try:
             await writer.wait_closed()
@@ -1685,6 +1792,7 @@ async def handle_client(
 
 
 async def main_async(config: GatewayConfig) -> None:
+    prewarm_static_cache()
     session_manager = SessionManager(config) if config.mode == "pty" else None
     if session_manager:
         session_manager.start()

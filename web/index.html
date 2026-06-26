@@ -8,10 +8,11 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Server Console">
   <title>Server Console</title>
-  <link rel="manifest" href="/manifest.webmanifest?v=70">
+  <link rel="manifest" href="/manifest.webmanifest?v=88">
   <link rel="apple-touch-icon" href="/icons/icon.svg">
+  <link rel="preload" href="/vendor/xterm/xterm.min.js" as="script">
   <link rel="stylesheet" href="/vendor/xterm/xterm.min.css">
-  <link rel="stylesheet" href="/styles.css?v=70">
+  <link rel="stylesheet" href="/styles.css?v=88">
 </head>
 <body>
   <main class="app-shell">
@@ -63,6 +64,8 @@
 
   <script src="/vendor/xterm/xterm.min.js"></script>
   <script src="/vendor/xterm/addon-fit.min.js"></script>
-  <script src="/app.js?v=70" type="module"></script>
+  <script src="/vendor/xterm/addon-canvas.min.js"></script>
+  <script src="/vendor/xterm/addon-webgl.min.js"></script>
+  <script src="/app.js?v=88" type="module"></script>
 </body>
 </html>

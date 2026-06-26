@@ -46,11 +46,13 @@ const appHeightChangeThresholdPx = 2;
 const viewportLayoutSettleMs = 700;
 const keyboardActivityWindowMs = 3000;
 const keyboardResizeSettleMs = 180;
-const backgroundSuspendDelayMs = 2500;
+const keyboardLayoutFreezeMs = 900;
+const backgroundSuspendDelayMs = 250;
 const terminalFitRetryDelayMs = 90;
 const terminalFitMaxRetries = 6;
 const stableLayoutDelaysMs = [90, 240, 520, 900];
 const restartLayoutDelaysMs = [0, 80, 220, 520, 900];
+const localEchoMaxChars = 512;
 const viewportContent = "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover";
 const encoder = new TextEncoder();
 let terminalDecoder = new TextDecoder();
@@ -80,12 +82,14 @@ let fitAddon = null;
 let term = null;
 let resizeTimer = null;
 let resizeAfterKeyboardTimer = 0;
+let keyboardLayoutTimer = 0;
 let reconnectTimer = null;
 let reconnectCountdownTimer = null;
 let connectTimeoutTimer = null;
 let foregroundReconnectTimer = null;
 let reconnectEnabled = false;
 let reconnectAttempts = 0;
+let forceReconnectOnVisible = false;
 let restartPending = false;
 let outputQueue = [];
 let outputQueueHead = 0;
@@ -111,13 +115,17 @@ let terminalReviewOutputPausedUntil = 0;
 let terminalReviewScrollTop = null;
 let preserveLatestOnScheduledFit = false;
 let keyboardActivityUntil = 0;
+let keyboardLayoutFrozenUntil = 0;
 let terminalInputFocused = false;
 let backgroundSuspendTimer = 0;
 let terminalTouchStartY = 0;
+let terminalTouchStartScrollTop = 0;
 let terminalTouchActive = false;
 let draftSubmitPending = false;
 let userReviewingOutput = false;
 let lastOutputSequence = 0;
+let renderedOutputSequence = 0;
+let pendingLocalEcho = "";
 let activeSessionCreatedAt = 0;
 let currentCwd = "";
 let terminalViewportElement = null;
@@ -138,6 +146,9 @@ let lastViewportWidth = 0;
 let lastViewportGutter = 0;
 let lastViewportTop = 0;
 let lastViewportLeft = 0;
+let lastUnlockedTerminalHeight = 0;
+let lastTerminalPanY = 0;
+let viewportScrollLockFrame = 0;
 let lastConnectButtonText = "";
 let lastConnectButtonAriaLabel = "";
 let lastRestartButtonDisabled = null;
@@ -207,6 +218,15 @@ newOutputButton.addEventListener("pointerdown", handleLatestButtonActivation);
 newOutputButton.addEventListener("touchend", handleLatestButtonActivation, { passive: false });
 newOutputButton.addEventListener("click", handleLatestButtonActivation);
 
+commandInput.addEventListener("pointerdown", () => {
+  if (document.activeElement === commandInput) return;
+  try {
+    commandInput.focus({ preventScroll: true });
+  } catch {
+    commandInput.focus();
+  }
+});
+
 commandInput.addEventListener("input", () => {
   noteKeyboardActivity();
   updateCommandInputEmptyState();
@@ -245,6 +265,7 @@ commandInput.addEventListener("focus", () => {
   updateCommandInputEmptyState();
   resetIOSViewportScale();
   updateViewportLayout();
+  settleTerminalAtBottomForKeyboard(true);
 });
 
 commandInput.addEventListener("blur", () => {
@@ -256,7 +277,9 @@ commandInput.addEventListener("blur", () => {
     hasUnreadOutput = false;
     suppressTerminalScrollTracking(viewportLayoutSettleMs);
   }
+  updateViewportLayout();
   scheduleViewportLayoutAfterDelay(80);
+  scheduleTerminalLayoutAfterKeyboard(shouldPreserveLatestForLayout());
 });
 
 window.addEventListener("resize", () => {
@@ -282,10 +305,7 @@ if (window.visualViewport) {
   });
 }
 window.addEventListener("pagehide", () => {
-  if (isKeyboardActivityRecent()) {
-    updateViewportLayout();
-    return;
-  }
+  forceReconnectOnVisible = true;
   scheduleBackgroundSuspend();
 });
 window.addEventListener("pageshow", () => {
@@ -303,7 +323,7 @@ window.addEventListener("focus", () => {
 window.addEventListener("online", reconnectWhenVisible);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
-    if (isKeyboardActivityRecent()) return;
+    forceReconnectOnVisible = true;
     scheduleBackgroundSuspend();
   } else {
     cancelBackgroundSuspend();
@@ -313,9 +333,11 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 document.addEventListener("freeze", () => {
-  if (isKeyboardActivityRecent()) return;
+  forceReconnectOnVisible = true;
   scheduleBackgroundSuspend();
 });
+document.addEventListener("touchmove", lockPageTouchMove, { passive: false });
+window.addEventListener("scroll", lockPageScroll, { passive: true });
 
 function updateViewportLayout() {
   const preserveLatest = shouldPreserveLatestForLayout();
@@ -326,6 +348,10 @@ function updateViewportLayout() {
   }
   const viewportChanged = syncVisualViewport();
   const compactChanged = syncCompactViewportClass();
+  if (isKeyboardViewportLocked()) {
+    settleTerminalAtBottomForKeyboard(preserveLatest || viewportChanged || compactChanged);
+    return;
+  }
   if (preserveLatest || viewportChanged || compactChanged) {
     scheduleFit(preserveLatest);
   }
@@ -348,6 +374,14 @@ function scheduleViewportLayoutAfterDelay(delayMs = 80) {
 }
 
 function scheduleStableTerminalLayout(forceStayAtBottom = false) {
+  if (isKeyboardViewportLocked()) {
+    settleTerminalAtBottomForKeyboard(forceStayAtBottom);
+    return;
+  }
+  if (shouldFreezeTerminalLayout()) {
+    scheduleTerminalLayoutAfterKeyboard(forceStayAtBottom);
+    return;
+  }
   clearStableLayoutTimers();
   stableLayoutTimers = stableLayoutDelaysMs.map(delayMs => window.setTimeout(() => {
     runTerminalLayoutPass(forceStayAtBottom, true);
@@ -384,6 +418,14 @@ function clearRestartLayoutTimers() {
 function runTerminalLayoutPass(forceStayAtBottom = false, forceResize = false) {
   syncVisualViewport();
   syncCompactViewportClass();
+  if (isKeyboardViewportLocked()) {
+    settleTerminalAtBottomForKeyboard(forceStayAtBottom || forceResize);
+    return;
+  }
+  if (shouldFreezeTerminalLayout()) {
+    scheduleTerminalLayoutAfterKeyboard(forceStayAtBottom || forceResize);
+    return;
+  }
   fitTerminal(forceStayAtBottom);
   sendResize({ force: forceResize });
 }
@@ -607,21 +649,47 @@ function initTerminal() {
   terminalViewportElement = terminalElement.querySelector(".xterm-viewport");
   observeTerminalSize();
   fitTerminal(true);
+  updateTerminalKeyboardPan();
   attachTerminalKeyboardFocusTracking();
 
   const viewport = terminalViewport();
   if (viewport) {
     viewport.addEventListener("scroll", handleTerminalScroll, { passive: true });
-    viewport.addEventListener("touchstart", handleTerminalTouchStart, { passive: true });
-    viewport.addEventListener("touchmove", handleTerminalTouchMove, { passive: false });
-    viewport.addEventListener("touchend", handleTerminalTouchEnd, { passive: true });
-    viewport.addEventListener("touchcancel", handleTerminalTouchEnd, { passive: true });
     viewport.addEventListener("wheel", handleTerminalWheel, { passive: true });
   }
+  const terminalWrap = terminalElement.closest(".terminal-wrap") || terminalElement;
+  terminalWrap.addEventListener("touchstart", handleTerminalTouchStart, { passive: false });
+  terminalWrap.addEventListener("touchmove", handleTerminalTouchMove, { passive: false });
+  terminalWrap.addEventListener("touchend", handleTerminalTouchEnd, { passive: true });
+  terminalWrap.addEventListener("touchcancel", handleTerminalTouchEnd, { passive: true });
 
-  term.onData(data => {
-    sendBytes(encoder.encode(data));
-  });
+  term.onData(handleTerminalInputData);
+}
+
+function handleTerminalInputData(data) {
+  noteKeyboardActivity();
+  if (sendBytes(encoder.encode(data))) {
+    echoPrintableTerminalInput(data);
+  }
+}
+
+function echoPrintableTerminalInput(data) {
+  if (!term || !data || !isPrintableTerminalText(data)) return;
+
+  term.write(data);
+  pendingLocalEcho = `${pendingLocalEcho}${data}`.slice(-localEchoMaxChars);
+}
+
+function isPrintableTerminalText(data) {
+  for (let index = 0; index < data.length; index += 1) {
+    const code = data.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f || code === 0x1b) return false;
+  }
+  return true;
+}
+
+function clearPendingLocalEcho() {
+  pendingLocalEcho = "";
 }
 
 function loadTerminalRenderer() {
@@ -698,7 +766,7 @@ function connect() {
   }
   setStatus("connecting", "Connecting", "Opening WebSocket");
   persistServerUrl();
-  const url = websocketUrl();
+  const url = resumeWebSocketUrl(websocketUrl());
 
   let currentSocket;
   try {
@@ -764,8 +832,23 @@ function connect() {
   });
 }
 
+function resumeWebSocketUrl(value) {
+  const replayAfter = Math.min(lastOutputSequence || 0, renderedOutputSequence || 0);
+  if (!replayAfter || !activeSessionCreatedAt) return value;
+
+  try {
+    const parsed = new URL(value, location.href);
+    parsed.searchParams.set("after", String(replayAfter));
+    parsed.searchParams.set("createdAt", String(activeSessionCreatedAt));
+    return parsed.toString();
+  } catch {
+    return value;
+  }
+}
+
 function disconnect(updateStatus = true, disableReconnect = true, clearCurrentSocket = true) {
   restartPending = false;
+  clearPendingLocalEcho();
   resetRestoreState();
   clearStableLayoutTimers();
   clearRestartLayoutTimers();
@@ -778,6 +861,8 @@ function disconnect(updateStatus = true, disableReconnect = true, clearCurrentSo
   window.clearTimeout(connectTimeoutTimer);
   window.clearTimeout(foregroundReconnectTimer);
   window.clearTimeout(resizeAfterKeyboardTimer);
+  window.clearTimeout(keyboardLayoutTimer);
+  keyboardLayoutTimer = 0;
   const currentSocket = socket;
   if (clearCurrentSocket) {
     socket = null;
@@ -810,12 +895,20 @@ function scheduleReconnect(delayMs = null) {
 }
 
 function reconnectWhenVisible() {
-  if (!reconnectEnabled || connected || document.visibilityState === "hidden") return;
-  if (socket && socket.readyState !== WebSocket.CLOSED) return;
+  if (!reconnectEnabled || document.visibilityState === "hidden") return;
   window.clearTimeout(foregroundReconnectTimer);
   foregroundReconnectTimer = window.setTimeout(() => {
     foregroundReconnectTimer = null;
-    if (!reconnectEnabled || connected || document.visibilityState === "hidden") return;
+    if (!reconnectEnabled || document.visibilityState === "hidden") return;
+    if (forceReconnectOnVisible) {
+      forceReconnectOnVisible = false;
+      reconnectAttempts = 0;
+      reconnectEnabled = true;
+      disconnect(false, false, true);
+      connect();
+      return;
+    }
+    if (connected) return;
     if (socket && socket.readyState !== WebSocket.CLOSED) return;
     connect();
   }, foregroundReconnectDelayMs);
@@ -837,10 +930,6 @@ function cancelBackgroundSuspend() {
 }
 
 function suspendConnectionForBackground() {
-  if (isKeyboardActivityRecent()) {
-    updateViewportLayout();
-    return;
-  }
   if (!reconnectEnabled && !socket) return;
   clearStableLayoutTimers();
   clearRestartLayoutTimers();
@@ -849,6 +938,8 @@ function suspendConnectionForBackground() {
   window.clearTimeout(connectTimeoutTimer);
   window.clearTimeout(foregroundReconnectTimer);
   window.clearTimeout(resizeAfterKeyboardTimer);
+  window.clearTimeout(keyboardLayoutTimer);
+  keyboardLayoutTimer = 0;
   const currentSocket = socket;
   resetRestoreState();
   socket = null;
@@ -863,6 +954,7 @@ function suspendConnectionForBackground() {
 
 function noteKeyboardActivity() {
   keyboardActivityUntil = Date.now() + keyboardActivityWindowMs;
+  keyboardLayoutFrozenUntil = Math.max(keyboardLayoutFrozenUntil, Date.now() + keyboardLayoutFreezeMs);
 }
 
 function noteViewportKeyboardActivity() {
@@ -936,6 +1028,7 @@ function sendEnterAction() {
 function handleSlashCommand(command) {
   switch (command) {
     case "/clear":
+      clearPendingLocalEcho();
       term.clear();
       break;
     case "/ping":
@@ -962,6 +1055,7 @@ function handleSlashCommand(command) {
 function restartTerminal() {
   if (restartPending || !connected || !socket || socket.readyState !== WebSocket.OPEN) return;
   restartPending = true;
+  clearPendingLocalEcho();
   reconnectEnabled = true;
   rememberAutoConnect(true);
   reconnectAttempts = 0;
@@ -995,6 +1089,7 @@ function resetTerminalReviewState(lockLatest = false) {
 }
 
 function discardPendingTerminalOutput() {
+  clearPendingLocalEcho();
   outputQueue = [];
   outputQueueHead = 0;
   outputQueueChars = 0;
@@ -1111,11 +1206,29 @@ function handleOutputPayload(data, sequenceValue) {
 function ingestOutputText(text, sequenceValue) {
   const sequence = normalizedOutputSequence(sequenceValue);
   const restoreChunk = takeRestoreOutputChunk();
-  if (!restoreChunk && shouldSkipOutputSequence(sequence)) {
+  if (shouldSkipOutputSequence(sequence)) {
     noteSkippedRestoreChunk(restoreChunk);
     return;
   }
+  text = consumePendingLocalEcho(text);
   enqueueTerminalOutput(text, restoreChunk, sequence);
+}
+
+function consumePendingLocalEcho(text) {
+  if (!pendingLocalEcho || !text) return text;
+
+  let offset = 0;
+  const limit = Math.min(pendingLocalEcho.length, text.length);
+  while (offset < limit && pendingLocalEcho.charCodeAt(offset) === text.charCodeAt(offset)) {
+    offset += 1;
+  }
+  if (offset === 0) {
+    pendingLocalEcho = "";
+    return text;
+  }
+
+  pendingLocalEcho = pendingLocalEcho.slice(offset);
+  return text.slice(offset);
 }
 
 function normalizedOutputSequence(value) {
@@ -1208,7 +1321,7 @@ function updateCommandInputEmptyState() {
   commandInputEmptyState = empty;
   commandInput.classList.toggle("is-empty", empty);
   commandRow?.classList.toggle("is-empty", empty);
-  commandInput.placeholder = empty ? "" : commandInputPlaceholder;
+  commandInput.placeholder = commandInputPlaceholder;
 }
 
 function isLocalSlashCommand(command) {
@@ -1240,7 +1353,7 @@ function enqueueTerminalOutput(text, restoreChunk = false, sequence = 0) {
   if (sequence > 0) {
     lastOutputSequence = Math.max(lastOutputSequence, sequence);
   }
-  outputQueue.push({ text, restoreChunk });
+  outputQueue.push({ text, restoreChunk, sequence });
   outputQueueChars += text.length;
   if (restoreChunk) {
     restoreReceivedChunks += 1;
@@ -1303,10 +1416,14 @@ function flushTerminalOutput(flushAll = false, forceStayAtBottom = false) {
 
   const reviewingOutput = !forceStayAtBottom && !isLatestFollowLocked() && (isUserReviewingOutput() || terminalTouchActive || !isTerminalAtBottom());
   const preservedReviewScrollTop = reviewingOutput ? captureTerminalReviewScrollTop() : null;
-  const text = takeQueuedTerminalOutput(flushAll === true ? outputQueueChars : outputFlushChunkChars);
+  const output = takeQueuedTerminalOutput(flushAll === true ? outputQueueChars : outputFlushChunkChars);
+  const text = output.text;
   terminalWriteInProgress += 1;
   term.write(text, () => {
     terminalWriteInProgress = Math.max(0, terminalWriteInProgress - 1);
+    if (output.maxSequence > 0) {
+      renderedOutputSequence = Math.max(renderedOutputSequence, output.maxSequence);
+    }
     if (reviewingOutput) {
       restoreTerminalReviewScrollTop(preservedReviewScrollTop);
       hasUnreadOutput = true;
@@ -1329,6 +1446,7 @@ function flushTerminalOutput(flushAll = false, forceStayAtBottom = false) {
 function takeQueuedTerminalOutput(limitChars) {
   let remaining = limitChars;
   const parts = [];
+  let maxSequence = 0;
 
   while (outputQueueHead < outputQueue.length && remaining > 0) {
     const item = outputQueue[outputQueueHead];
@@ -1336,6 +1454,7 @@ function takeQueuedTerminalOutput(limitChars) {
       const length = item.text.length;
       outputQueueHead += 1;
       parts.push(item.text);
+      maxSequence = Math.max(maxSequence, item.sequence || 0);
       outputQueueChars -= length;
       remaining -= length;
       if (item.restoreChunk) {
@@ -1355,7 +1474,7 @@ function takeQueuedTerminalOutput(limitChars) {
   }
 
   compactOutputQueueIfNeeded();
-  return parts.join("");
+  return { text: parts.join(""), maxSequence };
 }
 
 function compactOutputQueueIfNeeded() {
@@ -1377,12 +1496,27 @@ function startRestoreState(message) {
   const hasReplayMetadata = Object.prototype.hasOwnProperty.call(message, "replayChunks");
   const replayChunks = Math.max(0, Number(message.replayChunks) || 0);
   const replayBytes = Math.max(0, Number(message.replayBytes) || 0);
+  const replayAfter = normalizedOutputSequence(message.replayAfter);
+  const replayGap = message.replayGap === true;
+  const hasReplayIncremental = Object.prototype.hasOwnProperty.call(message, "replayIncremental");
+  const replayIncremental = hasReplayIncremental ? message.replayIncremental === true : replayAfter > 0 && !replayGap;
   restartPending = false;
   restoreShell = shell;
   restoreReplayBytes = replayBytes;
+  resetTerminalReviewState(true);
   if (createdAt && createdAt !== activeSessionCreatedAt) {
     activeSessionCreatedAt = createdAt;
+  }
+
+  discardPendingTerminalOutput();
+  if (replayIncremental) {
+    lastOutputSequence = replayAfter;
+    renderedOutputSequence = Math.max(renderedOutputSequence, replayAfter);
+  } else {
+    clearPendingLocalEcho();
     lastOutputSequence = 0;
+    renderedOutputSequence = 0;
+    term?.clear();
   }
   if (Object.prototype.hasOwnProperty.call(message, "cwd") && (message.cwd || !currentCwd)) {
     updateCwdOverlay(message.cwd || "");
@@ -1604,7 +1738,11 @@ function handleTerminalTouchStart(event) {
   if (isLatestFollowLocked()) return;
   terminalTouchActive = true;
   terminalTouchStartY = event.touches?.[0]?.clientY || 0;
-  terminalReviewScrollTop = terminalViewport()?.scrollTop ?? null;
+  terminalTouchStartScrollTop = terminalViewport()?.scrollTop ?? 0;
+  terminalReviewScrollTop = terminalTouchStartScrollTop;
+  if (isKeyboardViewportLocked()) {
+    event.preventDefault();
+  }
   if (!isTerminalAtBottom()) {
     markUserReviewingOutput();
   }
@@ -1615,6 +1753,17 @@ function handleTerminalTouchMove(event) {
   const viewport = terminalViewport();
   const currentY = event.touches?.[0]?.clientY || terminalTouchStartY;
   const deltaY = currentY - terminalTouchStartY;
+  if (isKeyboardViewportLocked()) {
+    if (viewport) {
+      viewport.scrollTop = terminalTouchStartScrollTop - deltaY;
+      terminalReviewScrollTop = viewport.scrollTop;
+      if (Math.abs(deltaY) > 2 && !isTerminalAtBottom()) {
+        markUserReviewingOutput();
+      }
+    }
+    event.preventDefault();
+    return;
+  }
   if (viewport && Math.abs(deltaY) > 2) {
     markUserReviewingOutput();
     terminalReviewScrollTop = viewport.scrollTop;
@@ -1782,6 +1931,7 @@ function attachTerminalKeyboardFocusTracking() {
       suppressTerminalScrollTracking(viewportLayoutSettleMs);
     }
     updateViewportLayout();
+    settleTerminalAtBottomForKeyboard(true);
   });
 
   helperTextarea.addEventListener("blur", () => {
@@ -1792,7 +1942,9 @@ function attachTerminalKeyboardFocusTracking() {
       hasUnreadOutput = false;
       suppressTerminalScrollTracking(viewportLayoutSettleMs);
     }
+    updateViewportLayout();
     scheduleViewportLayoutAfterDelay(80);
+    scheduleTerminalLayoutAfterKeyboard(shouldPreserveLatestForLayout());
   });
 }
 
@@ -1807,27 +1959,20 @@ function restoreInputFocusIfRecent() {
 }
 
 function syncVisualViewport() {
-  const viewport = window.visualViewport;
-  const height = viewport?.height || window.innerHeight;
-  const width = viewport?.width || window.innerWidth;
-  const useViewportOffset = isKeyboardActivityRecent() && !terminalTouchActive && !isUserReviewingOutput();
-  const top = useViewportOffset ? (viewport?.offsetTop || 0) : 0;
-  const left = useViewportOffset ? (viewport?.offsetLeft || 0) : 0;
+  const layout = currentViewportLayout();
   let changed = false;
-  if (Number.isFinite(height) && height > 0) {
-    const roundedHeight = Math.round(height);
-    if (roundedHeight !== lastViewportHeight) {
-      lastViewportHeight = roundedHeight;
-      rootStyle.setProperty("--app-height", `${roundedHeight}px`);
+  if (Number.isFinite(layout.height) && layout.height > 0) {
+    if (layout.height !== lastViewportHeight) {
+      lastViewportHeight = layout.height;
+      rootStyle.setProperty("--app-height", `${layout.height}px`);
       changed = true;
     }
   }
-  if (Number.isFinite(width) && width > 0) {
-    const roundedWidth = Math.round(width);
-    const gutter = Math.max(0, Math.round((roundedWidth - 980) / 2));
-    if (roundedWidth !== lastViewportWidth) {
-      lastViewportWidth = roundedWidth;
-      rootStyle.setProperty("--app-width", `${roundedWidth}px`);
+  if (Number.isFinite(layout.width) && layout.width > 0) {
+    const gutter = Math.max(0, Math.round((layout.width - 980) / 2));
+    if (layout.width !== lastViewportWidth) {
+      lastViewportWidth = layout.width;
+      rootStyle.setProperty("--app-width", `${layout.width}px`);
       changed = true;
     }
     if (gutter !== lastViewportGutter) {
@@ -1836,23 +1981,115 @@ function syncVisualViewport() {
       changed = true;
     }
   }
-  if (Number.isFinite(top)) {
-    const roundedTop = Math.round(top);
-    if (roundedTop !== lastViewportTop) {
-      lastViewportTop = roundedTop;
-      rootStyle.setProperty("--app-top", `${roundedTop}px`);
+  if (Number.isFinite(layout.top)) {
+    if (layout.top !== lastViewportTop) {
+      lastViewportTop = layout.top;
+      rootStyle.setProperty("--app-top", `${layout.top}px`);
       changed = true;
     }
   }
-  if (Number.isFinite(left)) {
-    const roundedLeft = Math.round(left);
-    if (roundedLeft !== lastViewportLeft) {
-      lastViewportLeft = roundedLeft;
-      rootStyle.setProperty("--app-left", `${roundedLeft}px`);
+  if (Number.isFinite(layout.left)) {
+    if (layout.left !== lastViewportLeft) {
+      lastViewportLeft = layout.left;
+      rootStyle.setProperty("--app-left", `${layout.left}px`);
       changed = true;
     }
+  }
+  if (isKeyboardViewportLocked()) {
+    bodyElement.classList.add("keyboard-locked");
+    updateTerminalKeyboardPan();
+    lockPageScroll();
+  } else {
+    bodyElement.classList.remove("keyboard-locked");
+    updateTerminalKeyboardPan();
   }
   return changed;
+}
+
+function currentViewportLayout() {
+  const viewport = window.visualViewport;
+  const locked = isKeyboardViewportLocked();
+  const height = locked ? (viewport?.height || window.innerHeight) : window.innerHeight;
+  const width = locked ? (viewport?.width || window.innerWidth) : window.innerWidth;
+  const top = locked ? (viewport?.offsetTop || 0) : 0;
+  const left = locked ? (viewport?.offsetLeft || 0) : 0;
+  return {
+    height: Math.max(1, Math.round(height || 0)),
+    width: Math.max(1, Math.round(width || 0)),
+    top: Math.round(top || 0),
+    left: Math.round(left || 0)
+  };
+}
+
+function isKeyboardViewportLocked() {
+  return !nativeWrapperMode && isCompactViewport() && (inputFocused || terminalInputFocused);
+}
+
+function lockPageTouchMove(event) {
+  if (!isKeyboardViewportLocked()) return;
+  const target = event.target;
+  if (canScrollInsideLockedViewport(target)) return;
+  event.preventDefault();
+}
+
+function canScrollInsideLockedViewport(target) {
+  if (!target || typeof target.closest !== "function") return false;
+  if (target.closest("#commandInput, .slash-strip")) return true;
+  return false;
+}
+
+function lockPageScroll() {
+  if (!isKeyboardViewportLocked()) return;
+  if (window.scrollX === 0 && window.scrollY === 0) return;
+  if (viewportScrollLockFrame) return;
+  viewportScrollLockFrame = window.requestAnimationFrame(() => {
+    viewportScrollLockFrame = 0;
+    window.scrollTo(0, 0);
+  });
+}
+
+function updateTerminalKeyboardPan() {
+  const currentHeight = Math.round(terminalElement.getBoundingClientRect().height || 0);
+  if (!currentHeight) return;
+
+  if (!isKeyboardViewportLocked()) {
+    lastUnlockedTerminalHeight = currentHeight;
+    setTerminalPanY(0);
+    return;
+  }
+
+  const baseHeight = Math.max(lastUnlockedTerminalHeight, currentHeight);
+  const pan = Math.max(0, baseHeight - currentHeight);
+  setTerminalPanY(-pan);
+}
+
+function setTerminalPanY(value) {
+  const rounded = Math.round(value || 0);
+  if (rounded === lastTerminalPanY) return;
+  lastTerminalPanY = rounded;
+  rootStyle.setProperty("--terminal-pan-y", `${rounded}px`);
+}
+
+function settleTerminalAtBottomForKeyboard(forceStayAtBottom = false) {
+  if (!term) return;
+  if (forceStayAtBottom || followLatestOutput || !userReviewingOutput) {
+    scrollTerminalToBottomWithoutResize();
+    window.requestAnimationFrame(scrollTerminalToBottomWithoutResize);
+    window.setTimeout(scrollTerminalToBottomWithoutResize, 210);
+  }
+}
+
+function scrollTerminalToBottomWithoutResize() {
+  if (!term) return;
+  suppressTerminalScrollTracking(viewportLayoutSettleMs);
+  term.scrollToBottom();
+  forceTerminalViewportToBottom();
+  followLatestOutput = true;
+  hasUnreadOutput = false;
+  userReviewingOutput = false;
+  terminalReviewOutputPausedUntil = 0;
+  terminalReviewScrollTop = null;
+  updateNewOutputButton();
 }
 
 function syncCompactViewportClass() {
@@ -1925,6 +2162,43 @@ function shouldPreserveLatestForLayout() {
   return inputFocused || Date.now() - lastInputBlurAt <= viewportLayoutSettleMs || followLatestOutput;
 }
 
+function shouldFreezeTerminalLayout() {
+  return isCompactViewport() && isKeyboardLayoutFrozen() && !restartPending && !nativeWrapperMode;
+}
+
+function isKeyboardLayoutFrozen() {
+  return inputFocused || terminalInputFocused || Date.now() < keyboardLayoutFrozenUntil;
+}
+
+function scheduleTerminalLayoutAfterKeyboard(forceStayAtBottom = false) {
+  preserveLatestOnScheduledFit = preserveLatestOnScheduledFit || forceStayAtBottom;
+  window.clearTimeout(resizeTimer);
+  resizeTimer = null;
+  window.clearTimeout(resizeAfterKeyboardTimer);
+  resizeAfterKeyboardTimer = 0;
+  window.clearTimeout(keyboardLayoutTimer);
+
+  if (inputFocused || terminalInputFocused) {
+    keyboardLayoutTimer = 0;
+    return;
+  }
+
+  const delayMs = Math.max(
+    keyboardResizeSettleMs,
+    keyboardLayoutFrozenUntil - Date.now() + keyboardResizeSettleMs
+  );
+  keyboardLayoutTimer = window.setTimeout(() => {
+    keyboardLayoutTimer = 0;
+    if (shouldFreezeTerminalLayout()) {
+      scheduleTerminalLayoutAfterKeyboard(preserveLatestOnScheduledFit);
+      return;
+    }
+    const shouldPreserveLatest = preserveLatestOnScheduledFit;
+    preserveLatestOnScheduledFit = false;
+    runTerminalLayoutPass(shouldPreserveLatest, true);
+  }, delayMs);
+}
+
 function resetIOSViewportScale() {
   if (!isIOSLike() || !viewportMeta) return;
 
@@ -1971,6 +2245,16 @@ function observeTerminalSize() {
     const entry = entries[0];
     const rect = entry?.contentRect;
     if (!rect || rect.width <= 0 || rect.height <= 0) return;
+    if (isKeyboardViewportLocked()) {
+      updateTerminalKeyboardPan();
+      settleTerminalAtBottomForKeyboard(shouldPreserveLatestForLayout());
+      return;
+    }
+    updateTerminalKeyboardPan();
+    if (shouldFreezeTerminalLayout()) {
+      scheduleTerminalLayoutAfterKeyboard(shouldPreserveLatestForLayout());
+      return;
+    }
     scheduleFit(shouldPreserveLatestForLayout());
   });
   terminalResizeObserver.observe(terminalElement);
@@ -1978,6 +2262,10 @@ function observeTerminalSize() {
 
 function fitTerminal(forceStayAtBottom = false) {
   if (!fitAddon || !term) return;
+  if (shouldFreezeTerminalLayout()) {
+    scheduleTerminalLayoutAfterKeyboard(forceStayAtBottom);
+    return;
+  }
   const proposed = fitAddon.proposeDimensions?.();
   if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) {
     scheduleTerminalFitRetry(forceStayAtBottom);
@@ -2038,6 +2326,14 @@ function refreshTerminal() {
 }
 
 function scheduleFit(forceStayAtBottom = false) {
+  if (isKeyboardViewportLocked()) {
+    settleTerminalAtBottomForKeyboard(forceStayAtBottom);
+    return;
+  }
+  if (shouldFreezeTerminalLayout()) {
+    scheduleTerminalLayoutAfterKeyboard(forceStayAtBottom);
+    return;
+  }
   preserveLatestOnScheduledFit = preserveLatestOnScheduledFit || forceStayAtBottom;
   window.clearTimeout(resizeTimer);
   resizeTimer = window.setTimeout(() => {
@@ -2050,8 +2346,8 @@ function scheduleFit(forceStayAtBottom = false) {
 function sendResize(options = {}) {
   if (!term || !socket || socket.readyState !== WebSocket.OPEN) return;
   const force = options.force === true;
-  if (!force && isKeyboardActivityRecent()) {
-    scheduleResizeAfterKeyboard();
+  if (!force && shouldFreezeTerminalLayout()) {
+    scheduleTerminalLayoutAfterKeyboard(shouldPreserveLatestForLayout());
     return;
   }
   window.clearTimeout(resizeAfterKeyboardTimer);
@@ -2065,11 +2361,7 @@ function sendResize(options = {}) {
 }
 
 function scheduleResizeAfterKeyboard() {
-  window.clearTimeout(resizeAfterKeyboardTimer);
-  resizeAfterKeyboardTimer = window.setTimeout(() => {
-    resizeAfterKeyboardTimer = 0;
-    runTerminalLayoutPass(shouldPreserveLatestForLayout(), true);
-  }, Math.max(keyboardResizeSettleMs, keyboardActivityUntil - Date.now() + 80));
+  scheduleTerminalLayoutAfterKeyboard(shouldPreserveLatestForLayout());
 }
 
 function setStatus(kind, label, detail = "") {

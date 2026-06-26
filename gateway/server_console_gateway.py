@@ -26,7 +26,7 @@ import struct
 import subprocess
 import time
 import urllib.parse
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -42,19 +42,48 @@ except ImportError:  # pragma: no cover - Windows preview path.
     PTY_AVAILABLE = False
 
 
+def env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
+def env_float(name: str, default: float, minimum: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_FRAME_BYTES = 1024 * 1024
-SESSION_OUTPUT_BUFFER_BYTES = 32 * 1024
-SESSION_REPLAY_BYTES = 32 * 1024
+STATIC_CACHE_MAX_BYTES = 32 * 1024
+SESSION_OUTPUT_BUFFER_BYTES = env_int("SESSION_OUTPUT_BUFFER_BYTES", 4 * 1024 * 1024, 64 * 1024)
+SESSION_REPLAY_BYTES = min(
+    SESSION_OUTPUT_BUFFER_BYTES,
+    env_int("SESSION_REPLAY_BYTES", 128 * 1024, 64 * 1024),
+)
 # Must stay <= SESSION_OUTPUT_BUFFER_BYTES so the newest chunk survives
 # _trim_output_buffer() and remains available for replay on reconnect.
-PTY_READ_CHUNK_BYTES = 32 * 1024
+PTY_READ_CHUNK_BYTES = min(
+    SESSION_OUTPUT_BUFFER_BYTES,
+    env_int("PTY_READ_CHUNK_BYTES", 64 * 1024, 4 * 1024),
+)
+PTY_READ_BURST_BYTES = min(
+    SESSION_OUTPUT_BUFFER_BYTES,
+    env_int("PTY_READ_BURST_BYTES", 128 * 1024, PTY_READ_CHUNK_BYTES),
+)
+MAX_LIVE_WRITE_BUFFER_BYTES = env_int("MAX_LIVE_WRITE_BUFFER_BYTES", 512 * 1024, 64 * 1024)
 SESSION_IDLE_TIMEOUT_SECONDS = 12 * 60 * 60
 CWD_POLL_INTERVAL_SECONDS = 1.0
 CWD_POLL_MAX_INTERVAL_SECONDS = 5.0
 CWD_POLL_TIMEOUT_SECONDS = 0.5
 ATTACHED_WRITER_CLOSE_TIMEOUT_SECONDS = 1.0
 WEBSOCKET_DRAIN_TIMEOUT_SECONDS = 5.0
+LIVE_WEBSOCKET_DRAIN_TIMEOUT_SECONDS = env_float("LIVE_WEBSOCKET_DRAIN_TIMEOUT_SECONDS", 0.25, 0.05)
 HTTP_REQUEST_READ_TIMEOUT_SECONDS = 10.0
 MAX_KEEPALIVE_REQUESTS = 64
 PTY_WRITE_TIMEOUT_SECONDS = 10.0
@@ -76,8 +105,7 @@ GZIPPABLE_TYPES = (
     "application/manifest+json",
     "image/svg+xml",
 )
-STATIC_FILE_CACHE: dict[str, tuple[int, int, bytes, str, Optional[bytes]]] = {}
-
+STATIC_FILE_CACHE: OrderedDict[str, tuple[int, int, bytes, str, Optional[bytes]]] = OrderedDict()
 
 @dataclass(slots=True)
 class GatewayConfig:
@@ -199,6 +227,28 @@ def session_id_from_request(request_line: str) -> str:
     return cleaned or "phone"
 
 
+def replay_after_sequence_from_request(request_line: str) -> int:
+    params = request_query(request_line)
+    value = params.get("after", ["0"])[0]
+    try:
+        sequence = int(value)
+    except (TypeError, ValueError):
+        return 0
+    if sequence < 0:
+        return 0
+    return min(sequence, 0xFFFFFFFF)
+
+
+def replay_created_at_from_request(request_line: str) -> float:
+    params = request_query(request_line)
+    value = params.get("createdAt", ["0"])[0]
+    try:
+        created_at = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return created_at if created_at > 0 else 0.0
+
+
 async def send_http_error(writer: asyncio.StreamWriter, code: int, message: str) -> None:
     body = f"{code} {message}\n".encode("utf-8")
     writer.write(
@@ -316,6 +366,12 @@ def cache_control_for_path(path: str) -> str:
     return "public, max-age=31536000, immutable"
 
 
+def cache_control_for_response(path: str, size: int) -> str:
+    if size > STATIC_CACHE_MAX_BYTES:
+        return "no-cache"
+    return cache_control_for_path(path)
+
+
 def static_content_type(full_path: str) -> str:
     content_type = mimetypes.guess_type(full_path)[0] or "application/octet-stream"
     if full_path.endswith(".webmanifest"):
@@ -323,12 +379,36 @@ def static_content_type(full_path: str) -> str:
     return content_type
 
 
+def static_cache_entry_size(entry: tuple[int, int, bytes, str, Optional[bytes]]) -> int:
+    return len(entry[2]) + (len(entry[4]) if entry[4] is not None else 0)
+
+
+def static_cache_total_bytes() -> int:
+    return sum(static_cache_entry_size(entry) for entry in STATIC_FILE_CACHE.values())
+
+
+def remember_static_cache_entry(
+    cache_key: str,
+    stat_result: os.stat_result,
+    body: bytes,
+    content_type: str,
+    gzipped_body: Optional[bytes],
+) -> None:
+    entry = (stat_result.st_mtime_ns, stat_result.st_size, body, content_type, gzipped_body)
+    if static_cache_entry_size(entry) > STATIC_CACHE_MAX_BYTES:
+        STATIC_FILE_CACHE.pop(cache_key, None)
+        return
+
+    STATIC_FILE_CACHE[cache_key] = entry
+    STATIC_FILE_CACHE.move_to_end(cache_key)
+    while static_cache_total_bytes() > STATIC_CACHE_MAX_BYTES and STATIC_FILE_CACHE:
+        STATIC_FILE_CACHE.popitem(last=False)
+
+
 def prewarm_static_cache() -> None:
-    # Populate STATIC_FILE_CACHE (and precompute gzip for eligible files) at
-    # startup so the first request for a large asset like xterm.min.js (~283KB)
-    # does not pay read + level-9 compress latency on the event loop, which would
-    # otherwise stall every connection during that window. Best-effort: unreadable
-    # files are simply left to the lazy path in serve_static_file().
+    # Keep process-local static caching bounded: only files up to 32KB are cached.
+    # Larger assets are served normally from disk so no cache entry exceeds the
+    # project-wide cache cap.
     for dirpath, _dirnames, filenames in os.walk(WEB_DIR):
         for filename in filenames:
             full_path = os.path.join(dirpath, filename)
@@ -344,9 +424,9 @@ def prewarm_static_cache() -> None:
             gzipped_body = None
             if len(body) >= 1024 and is_gzippable_content_type(content_type):
                 gzipped_body = gzip.compress(body)
-            STATIC_FILE_CACHE[full_path] = (
-                stat_result.st_mtime_ns,
-                stat_result.st_size,
+            remember_static_cache_entry(
+                full_path,
+                stat_result,
                 body,
                 content_type,
                 gzipped_body,
@@ -376,6 +456,7 @@ async def serve_static_file(
     cache_key = full_path
     cached = STATIC_FILE_CACHE.get(cache_key)
     if cached and cached[0] == stat_result.st_mtime_ns and cached[1] == stat_result.st_size:
+        STATIC_FILE_CACHE.move_to_end(cache_key)
         body = cached[2]
         content_type = cached[3]
         gzipped_body = cached[4]
@@ -385,7 +466,7 @@ async def serve_static_file(
 
         content_type = static_content_type(full_path)
         gzipped_body = None
-        STATIC_FILE_CACHE[cache_key] = (stat_result.st_mtime_ns, stat_result.st_size, body, content_type, gzipped_body)
+        remember_static_cache_entry(cache_key, stat_result, body, content_type, gzipped_body)
 
     response_body = body
     content_encoding = None
@@ -393,15 +474,9 @@ async def serve_static_file(
     if accepts_gzip(accept_encoding) and can_gzip:
         if gzipped_body is None:
             # Compress off the event loop so a cache-miss on a large asset does
-            # not block other connections; startup prewarm covers the common case.
+            # not block other connections.
             gzipped_body = await asyncio.to_thread(gzip.compress, body)
-            STATIC_FILE_CACHE[cache_key] = (
-                stat_result.st_mtime_ns,
-                stat_result.st_size,
-                body,
-                content_type,
-                gzipped_body,
-            )
+            remember_static_cache_entry(cache_key, stat_result, body, content_type, gzipped_body)
         response_body = gzipped_body
         content_encoding = "gzip"
 
@@ -412,7 +487,7 @@ async def serve_static_file(
         response_body,
         content_type,
         content_encoding=content_encoding,
-        cache_control=cache_control_for_path(path),
+        cache_control=cache_control_for_response(path, len(body)),
         vary_accept_encoding=can_gzip,
         keep_alive=keep_alive,
     )
@@ -577,18 +652,22 @@ def encode_ws_frame(payload: bytes, opcode: int = 0x1) -> bytes:
     return header + payload
 
 
-async def _drain_if_buffered(writer: asyncio.StreamWriter) -> None:
+async def _drain_if_buffered(writer: asyncio.StreamWriter, timeout: float = WEBSOCKET_DRAIN_TIMEOUT_SECONDS) -> None:
     # Avoid per-frame wait_for() overhead when the transport has already accepted
     # the data; retain timeout backpressure when a slow client builds a buffer.
     transport = writer.transport
     if transport is None or transport.get_write_buffer_size() == 0:
         return
-    await asyncio.wait_for(writer.drain(), timeout=WEBSOCKET_DRAIN_TIMEOUT_SECONDS)
+    await asyncio.wait_for(writer.drain(), timeout=timeout)
 
 
-async def send_preencoded_ws_frame(writer: asyncio.StreamWriter, frame: bytes) -> None:
+async def send_preencoded_ws_frame(
+    writer: asyncio.StreamWriter,
+    frame: bytes,
+    timeout: float = WEBSOCKET_DRAIN_TIMEOUT_SECONDS,
+) -> None:
     writer.write(frame)
-    await _drain_if_buffered(writer)
+    await _drain_if_buffered(writer, timeout=timeout)
 
 
 async def send_preencoded_ws_frames(writer: asyncio.StreamWriter, frames: list[bytes]) -> None:
@@ -967,31 +1046,36 @@ class PersistentSession:
         self.reader_task = asyncio.create_task(self._reader_loop())
         self.cwd_task = asyncio.create_task(self._cwd_loop())
 
-    async def attach(self, writer: asyncio.StreamWriter, peer: object) -> None:
+    async def attach(
+        self,
+        writer: asyncio.StreamWriter,
+        peer: object,
+        replay_after_sequence: int = 0,
+        replay_created_at: float = 0.0,
+    ) -> None:
         refresh_cwd = False
         async with self.attach_lock:
             if self.closed:
                 raise SessionAttachError("session is closed")
 
             refresh_cwd = not self.attachments
+            effective_replay_after_sequence = self._effective_replay_after_sequence(
+                replay_after_sequence,
+                replay_created_at,
+            )
             # Enforce the current replay cap before exposing buffered history.
             self._trim_output_buffer()
             replay_until_sequence = self.output_sequence
-            replay_chunks, replay_bytes = self._recent_replay(replay_until_sequence)
+            replay_chunks, replay_bytes, replay_from_sequence, replay_gap = self._replay_chunks(
+                replay_until_sequence,
+                effective_replay_after_sequence,
+            )
             replay_chunk_count = len(replay_chunks)
             exit_code = self.exit_code
             session_writer = SessionWriter(lock=asyncio.Lock())
             self.attachments[writer] = session_writer
             self._invalidate_attachment_snapshot()
-            if not refresh_cwd:
-                self.cwd_polling_active.set()
-
-        if refresh_cwd:
-            cwd = await self._probe_current_cwd()
-            if cwd:
-                self.current_cwd = cwd
-            if self._is_attached(writer, session_writer):
-                self.cwd_polling_active.set()
+            self.cwd_polling_active.set()
 
         try:
             async with session_writer.lock:
@@ -1012,6 +1096,10 @@ class PersistentSession:
                         "cwd": self.current_cwd,
                         "replayChunks": replay_chunk_count,
                         "replayBytes": replay_bytes,
+                        "replayFrom": replay_from_sequence,
+                        "replayAfter": effective_replay_after_sequence,
+                        "replayGap": replay_gap,
+                        "replayIncremental": effective_replay_after_sequence > 0 and not replay_gap,
                     },
                 )
                 replay_frames: list[bytes] = []
@@ -1031,9 +1119,22 @@ class PersistentSession:
                     replay_until_sequence,
                     exit_sent=exit_code is not None,
                 )
+            if refresh_cwd and self._is_attached(writer, session_writer):
+                asyncio.create_task(self._refresh_cwd_after_attach(writer, session_writer))
         except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError):
             self.detach(writer)
             raise
+
+    def _effective_replay_after_sequence(self, replay_after_sequence: int, replay_created_at: float) -> int:
+        if replay_after_sequence <= 0:
+            return 0
+        if replay_created_at <= 0:
+            return 0
+        if abs(replay_created_at - self.created_at) > 0.001:
+            return 0
+        if replay_after_sequence > self.output_sequence:
+            return 0
+        return replay_after_sequence
 
     def detach(self, writer: asyncio.StreamWriter) -> None:
         if writer in self.attachments:
@@ -1146,7 +1247,7 @@ class PersistentSession:
     async def _reader_loop(self) -> None:
         while not self.closed:
             try:
-                data = read_pty_burst(self.fd, SESSION_OUTPUT_BUFFER_BYTES)
+                data = read_pty_burst(self.fd, PTY_READ_BURST_BYTES)
             except OSError:
                 data = b""
 
@@ -1194,12 +1295,27 @@ class PersistentSession:
             if task.done() and self.cwd_probe_task is task:
                 self.cwd_probe_task = None
 
+    async def _refresh_cwd_after_attach(
+        self,
+        writer: asyncio.StreamWriter,
+        session_writer: SessionWriter,
+    ) -> None:
+        try:
+            cwd = await self._probe_current_cwd()
+            if not cwd or self.closed or cwd == self.current_cwd:
+                return
+            self.current_cwd = cwd
+            if self._is_attached(writer, session_writer):
+                await self._send_cwd_to_attached(cwd)
+        except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError):
+            self.detach(writer)
+
     async def _drain_after_exit(self, idle_reads: int = 3) -> None:
         empty_reads = 0
 
         while empty_reads < idle_reads:
             try:
-                data = read_pty_burst(self.fd, SESSION_OUTPUT_BUFFER_BYTES)
+                data = read_pty_burst(self.fd, PTY_READ_BURST_BYTES)
             except OSError:
                 break
             if data:
@@ -1211,6 +1327,88 @@ class PersistentSession:
             if empty_reads < idle_reads:
                 await wait_for_fd_readable(self.fd)
 
+    def _replay_chunks(
+        self,
+        replay_until_sequence: int,
+        replay_after_sequence: int,
+    ) -> tuple[list[OutputChunk], int, int, bool]:
+        if replay_after_sequence > 0:
+            replay_chunks, replay_bytes, replay_from_sequence = self._incremental_replay(
+                replay_until_sequence,
+                replay_after_sequence,
+            )
+            first_new_sequence = next(
+                (
+                    chunk.sequence
+                    for chunk in replay_chunks
+                    if chunk.sequence > replay_after_sequence
+                ),
+                replay_until_sequence + 1,
+            )
+            replay_gap = first_new_sequence <= replay_until_sequence and first_new_sequence > replay_after_sequence + 1
+            return replay_chunks, replay_bytes, replay_from_sequence, replay_gap
+
+        replay_chunks, replay_bytes = self._recent_replay(replay_until_sequence)
+        replay_from_sequence = replay_chunks[0].sequence if replay_chunks else replay_until_sequence + 1
+        return replay_chunks, replay_bytes, replay_from_sequence, False
+
+    def _incremental_replay(
+        self,
+        replay_until_sequence: int,
+        replay_after_sequence: int,
+    ) -> tuple[list[OutputChunk], int, int]:
+        replay_size = 0
+        selected: list[OutputChunk] = []
+
+        for chunk in reversed(self.output_buffer):
+            if chunk.sequence > replay_until_sequence:
+                continue
+            if chunk.sequence <= replay_after_sequence:
+                break
+            if replay_size >= SESSION_REPLAY_BYTES:
+                break
+            if selected and replay_size + chunk.raw_length > SESSION_REPLAY_BYTES:
+                break
+            selected.append(chunk)
+            replay_size += chunk.raw_length
+
+        selected.reverse()
+
+        if selected:
+            context_chunk = next(
+                (
+                    chunk
+                    for chunk in reversed(self.output_buffer)
+                    if chunk.sequence <= replay_after_sequence
+                ),
+                None,
+            )
+            if (
+                context_chunk
+                and selected[0].sequence == replay_after_sequence + 1
+                and replay_size + context_chunk.raw_length <= SESSION_REPLAY_BYTES
+            ):
+                replay_chunks = [context_chunk, *selected]
+                replay_bytes = context_chunk.raw_length + replay_size
+                return replay_chunks, replay_bytes, replay_chunks[0].sequence
+            return selected, replay_size, selected[0].sequence
+
+        replay_from_sequence = replay_until_sequence + 1
+        context_chunk = next(
+            (
+                chunk
+                for chunk in reversed(self.output_buffer)
+                if chunk.sequence <= replay_after_sequence
+            ),
+            None,
+        )
+        if context_chunk is None:
+            return [], 0, replay_from_sequence
+
+        # No output was produced while the client was away. Send one old chunk so
+        # the browser TextDecoder can resume with the same trailing UTF-8 state.
+        return [context_chunk], context_chunk.raw_length, context_chunk.sequence
+
     def _recent_replay(self, replay_until_sequence: int) -> tuple[list[OutputChunk], int]:
         replay_size = 0
         selected: list[OutputChunk] = []
@@ -1219,6 +1417,8 @@ class PersistentSession:
             if chunk.sequence > replay_until_sequence:
                 continue
             if replay_size >= SESSION_REPLAY_BYTES:
+                break
+            if selected and replay_size + chunk.raw_length > SESSION_REPLAY_BYTES:
                 break
             selected.append(chunk)
             replay_size += chunk.raw_length
@@ -1306,7 +1506,10 @@ class PersistentSession:
         async with session_writer.lock:
             if not self._is_attached(writer, session_writer) or not session_writer.ready:
                 return
-            await send_preencoded_ws_frame(writer, frame)
+            transport = writer.transport
+            if transport is not None and transport.get_write_buffer_size() > MAX_LIVE_WRITE_BUFFER_BYTES:
+                raise ConnectionError("client write buffer exceeded live output limit")
+            await send_preencoded_ws_frame(writer, frame, timeout=LIVE_WEBSOCKET_DRAIN_TIMEOUT_SECONDS)
 
     def _close_process_resources(self, terminate: bool) -> None:
         if self.resources_closed:
@@ -1713,6 +1916,8 @@ async def handle_client(
 
             stop = asyncio.Event()
             session_id = session_id_from_request(request_line)
+            replay_after_sequence = replay_after_sequence_from_request(request_line)
+            replay_created_at = replay_created_at_from_request(request_line)
             if session_manager is None:
                 await send_json(writer, {"type": "error", "message": "session manager unavailable"})
                 return
@@ -1720,7 +1925,7 @@ async def handle_client(
             try:
                 session = await session_manager.get(session_id)
                 attachment = SessionAttachment(session)
-                await session.attach(writer, peer)
+                await session.attach(writer, peer, replay_after_sequence, replay_created_at)
                 await socket_to_persistent_session(reader, writer, attachment, session_manager, stop)
             except SessionAttachError as exc:
                 await send_json(writer, {"type": "error", "message": str(exc)})

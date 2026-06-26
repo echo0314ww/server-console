@@ -1,21 +1,18 @@
-const CACHE_NAME = "server-console-v90";
+const CACHE_NAME = "server-console-v101";
+const CACHE_MAX_BYTES = 32 * 1024;
 const cachePromise = caches.open(CACHE_NAME);
 const ASSETS = [
   "/",
   "/index.html",
-  "/styles.css?v=90",
-  "/app.js?v=90",
-  "/manifest.webmanifest?v=90",
+  "/styles.css?v=101",
+  "/manifest.webmanifest?v=101",
   "/icons/icon.svg",
   "/vendor/xterm/xterm.min.css",
-  "/vendor/xterm/xterm.min.js",
-  "/vendor/xterm/addon-fit.min.js",
-  "/vendor/xterm/addon-canvas.min.js",
-  "/vendor/xterm/addon-webgl.min.js"
+  "/vendor/xterm/addon-fit.min.js"
 ];
 
 self.addEventListener("install", event => {
-  event.waitUntil(cachePromise.then(cache => cache.addAll(ASSETS)));
+  event.waitUntil(precacheSmallAssets());
   self.skipWaiting();
 });
 
@@ -50,14 +47,25 @@ async function networkFirst(request) {
 
   try {
     const response = await fetch(request, { cache: "no-store" });
-    if (response.ok) {
-      cache.put(request, response.clone()).catch(() => {});
-    }
+    cacheResponseIfSmall(cache, request, response).catch(() => {});
     return response;
   } catch {
     const cached = await cache.match(request);
     if (cached) return cached;
     throw new Error("network unavailable and no cache entry found");
+  }
+}
+
+async function precacheSmallAssets() {
+  const cache = await cachePromise;
+  for (const asset of ASSETS) {
+    try {
+      const request = new Request(asset);
+      const response = await fetch(request, { cache: "no-store" });
+      await cacheResponseIfSmall(cache, request, response);
+    } catch {
+      // Installation should continue when an optional cached asset is unavailable.
+    }
   }
 }
 
@@ -67,10 +75,56 @@ async function cacheFirst(request) {
   if (cached) return cached;
 
   const response = await fetch(request);
-  if (response.ok) {
-    cache.put(request, response.clone()).catch(() => {});
-  }
+  cacheResponseIfSmall(cache, request, response).catch(() => {});
   return response;
+}
+
+async function cacheResponseIfSmall(cache, request, response) {
+  if (!response.ok) return;
+
+  const contentLength = Number(response.headers.get("content-length") || "0");
+  if (contentLength > CACHE_MAX_BYTES) return;
+  if (contentLength > 0) {
+    await cache.put(request, response.clone());
+    await trimCache(cache);
+    return;
+  }
+
+  const blob = await response.clone().blob();
+  if (blob.size <= CACHE_MAX_BYTES) {
+    await cache.put(request, response.clone());
+    await trimCache(cache);
+  }
+}
+
+async function trimCache(cache) {
+  const requests = await cache.keys();
+  let totalBytes = 0;
+  const entries = [];
+
+  for (const request of requests) {
+    const response = await cache.match(request);
+    if (!response) continue;
+    const size = await responseSize(response);
+    entries.push({ request, size });
+    totalBytes += size;
+  }
+
+  for (const entry of entries) {
+    if (totalBytes <= CACHE_MAX_BYTES) break;
+    await cache.delete(entry.request);
+    totalBytes -= entry.size;
+  }
+}
+
+async function responseSize(response) {
+  const contentLength = Number(response.headers.get("content-length") || "0");
+  if (contentLength > 0) return contentLength;
+  try {
+    return (await response.clone().blob()).size;
+  } catch {
+    return CACHE_MAX_BYTES + 1;
+  }
 }
 
 function isStaticAsset(pathname) {

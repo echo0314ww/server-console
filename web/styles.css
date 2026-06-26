@@ -16,6 +16,7 @@
   --app-width: 100vw;
   --app-gutter: 0px;
   --app-height: 100vh;
+  --terminal-pan-y: 0px;
 }
 
 * {
@@ -25,11 +26,9 @@
 html,
 body {
   width: 100%;
-  height: 100%;
-  height: 100dvh;
+  height: var(--app-height);
   min-width: 100%;
-  min-height: 100%;
-  min-height: 100dvh;
+  min-height: var(--app-height);
   margin: 0;
   background: var(--bg);
   color: var(--text);
@@ -39,6 +38,20 @@ body {
   overflow: hidden;
   overscroll-behavior: none;
   touch-action: manipulation;
+}
+
+body.keyboard-locked {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: var(--app-height);
+  min-height: var(--app-height);
+  overflow: hidden;
+}
+
+body.keyboard-locked .app-shell {
+  height: var(--app-height);
+  overflow: hidden;
 }
 
 button,
@@ -70,6 +83,7 @@ button {
   overflow: hidden;
   padding-top: env(safe-area-inset-top);
   padding-bottom: env(safe-area-inset-bottom);
+  transition: top 180ms ease, height 180ms ease;
 }
 
 @supports (height: 100svh) {
@@ -283,7 +297,7 @@ html[data-native-wrapper="1"] .terminal {
   padding: 12px;
   overflow: hidden;
   will-change: contents;
-  contain: strict;
+  contain: layout paint;
 }
 
 .terminal .xterm {
@@ -296,6 +310,8 @@ html[data-native-wrapper="1"] .terminal {
 .terminal .xterm-screen {
   max-width: 100%;
   overflow: hidden;
+  transform: translateY(var(--terminal-pan-y));
+  transition: transform 180ms ease;
 }
 
 .terminal .xterm-viewport {
@@ -445,34 +461,26 @@ html[data-native-wrapper="1"] .terminal {
 }
 
 .command-row::before {
-  content: attr(data-placeholder);
-  position: absolute;
-  left: 11px;
-  top: 10px;
-  max-width: calc(100% - 22px);
-  color: var(--muted);
-  font-size: 16px;
-  line-height: 1.35;
-  opacity: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  pointer-events: none;
-  z-index: 1;
+  content: none;
 }
 
 .command-row textarea {
+  position: relative;
+  z-index: 2;
   height: var(--command-input-min-height);
   resize: none;
   padding: 10px;
+  color: var(--text);
+  caret-color: var(--text);
   font-size: 16px;
   line-height: 1.35;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
+  pointer-events: auto;
 }
 
 .command-row.is-empty::before {
-  opacity: 1;
+  opacity: 0;
 }
 
 @supports (-webkit-touch-callout: none) {

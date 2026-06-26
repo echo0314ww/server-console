@@ -354,7 +354,7 @@ def is_gzippable_content_type(content_type: str) -> bool:
 
 
 def cache_control_for_path(path: str) -> str:
-    if path == "/" or path == "/index.html":
+    if path in ("/", "/index.html", "/service-worker.js"):
         return "no-cache"
     return "public, max-age=31536000, immutable"
 

@@ -422,7 +422,7 @@ function savedWebSocketUrl() {
 function persistServerUrl() {
   const rawValue = withDefaultSession(serverUrl.value.trim());
   rememberTransientToken(rawValue);
-  const value = stripTokenFromUrl(rawValue);
+  const value = normalizedWebSocketUrl(rawValue);
   if (!value) return;
   if (serverUrl.value !== value) {
     serverUrl.value = value;
@@ -453,7 +453,27 @@ function stripTokenFromUrl(value) {
 }
 
 function websocketUrl() {
-  return stripTokenFromUrl(withDefaultSession(serverUrl.value.trim()));
+  return normalizedWebSocketUrl(serverUrl.value.trim());
+}
+
+function normalizedWebSocketUrl(value) {
+  return upgradeSameHostWebSocketForSecurePage(stripTokenFromUrl(withDefaultSession(value)));
+}
+
+function upgradeSameHostWebSocketForSecurePage(value) {
+  if (location.protocol !== "https:" || !value) return value;
+
+  try {
+    const parsed = new URL(value, location.href);
+    if (parsed.protocol === "ws:" && parsed.hostname === location.hostname) {
+      parsed.protocol = "wss:";
+      return parsed.toString();
+    }
+  } catch {
+    return value;
+  }
+
+  return value;
 }
 
 function websocketProtocols() {

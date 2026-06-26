@@ -51,7 +51,9 @@ openssl rand -hex 24 > .server-console-token
 BIND_HOST=127.0.0.1 TOKEN_FILE=.server-console-token SHELL_CMD="tmux new-session -A -s phone" ./scripts/start-server.sh
 ```
 
-For local LAN testing you can bind to `0.0.0.0`, but do not expose it to the public internet without TLS and a reverse proxy:
+`scripts/start-server.sh` requires token authentication by default. For local LAN
+testing you can bind to `0.0.0.0`, but do not expose it to the public internet
+without TLS and a reverse proxy:
 
 ```bash
 BIND_HOST=0.0.0.0 TOKEN_FILE=.server-console-token ./scripts/start-server.sh
@@ -77,6 +79,11 @@ For production, put the gateway behind HTTPS and use:
 wss://your-domain.example/terminal?session=phone
 ```
 
+The repository includes a hardened systemd starting point at
+`deploy/systemd/server-console.service`. Install it only after creating a
+restricted `server-console` user and a token file that only that service user
+can read, such as `/etc/server-console/token`.
+
 ## Native iOS App Is Optional
 
 The native project is still here, but building it requires macOS and Xcode:
@@ -95,9 +102,23 @@ The script writes Xcode DerivedData to `ios/ServerConsole/DerivedData` inside th
 
 If you only have Windows, use the PWA path above.
 
+## Verification
+
+Run the lightweight smoke test after changing the gateway or cache behavior:
+
+```bash
+python3 scripts/smoke-gateway.py
+```
+
+It starts a temporary demo gateway and verifies static assets, cache headers,
+WebSocket token rejection, Origin rejection, and a successful authenticated
+WebSocket handshake.
+
 ## Protocol
 
-The WebSocket protocol uses JSON text messages.
+The WebSocket protocol uses JSON text messages for control messages. Terminal
+input/output can use binary frames for lower overhead, with JSON/base64 kept for
+compatibility.
 
 Client to server:
 
@@ -107,6 +128,8 @@ Client to server:
 {"type":"ping"}
 {"type":"restart"}
 ```
+
+Binary client input frames are `[0x00][raw terminal bytes]`.
 
 When token auth is enabled, the browser sends the token through the
 `server-console-token.<base64url-token>` WebSocket subprotocol. Query-string
@@ -124,12 +147,17 @@ Server to client:
 {"type":"pong","time":1234567890.0}
 ```
 
+Binary server output frames are `[0x00][uint32 big-endian sequence][raw terminal
+bytes]`.
+
 ## Security Notes
 
 This is intentionally a prototype, but it controls a server shell and must be treated as high risk.
 
 - Do not run the gateway as root.
 - Prefer `127.0.0.1` plus a TLS reverse proxy.
+- Keep token authentication enabled; `scripts/start-server.sh` requires it unless
+  `REQUIRE_TOKEN=0` is explicitly set for trusted local development.
 - Add user authentication before sharing this with anyone.
 - Add audit logging for commands and connection metadata.
 - Consider command allowlists or isolated containers for production.

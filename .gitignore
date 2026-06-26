@@ -6,6 +6,8 @@ __pycache__/
 .agents/
 .claude/
 .codex/
+.cache/
+.npm-cache/
 
 # Runtime files and secrets
 .server-console-token

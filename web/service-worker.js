@@ -1,11 +1,11 @@
-const CACHE_NAME = "server-console-v89";
+const CACHE_NAME = "server-console-v90";
 const cachePromise = caches.open(CACHE_NAME);
 const ASSETS = [
   "/",
   "/index.html",
-  "/styles.css?v=89",
-  "/app.js?v=89",
-  "/manifest.webmanifest?v=89",
+  "/styles.css?v=90",
+  "/app.js?v=90",
+  "/manifest.webmanifest?v=90",
   "/icons/icon.svg",
   "/vendor/xterm/xterm.min.css",
   "/vendor/xterm/xterm.min.js",

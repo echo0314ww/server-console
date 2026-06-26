@@ -10,7 +10,6 @@ __pycache__/
 .npm-cache/
 
 # Runtime files and secrets
-.server-console-token
 .server-console-preview.*
 *.log
 *.pid

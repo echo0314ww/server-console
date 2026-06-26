@@ -14,12 +14,11 @@ LOG="$ROOT_DIR/scripts/gateway-restart.log"
 BIND_HOST="${BIND_HOST:-172.18.0.1}"
 PORT="${PORT:-8765}"
 SHELL_CMD="${SHELL_CMD:-/bin/bash}"
-TOKEN_FILE="${TOKEN_FILE:-$ROOT_DIR/.server-console-token}"
 
 log() { printf '%s  %s\n' "$(date -Is)" "$*" >>"$LOG"; }
 
 : >"$LOG"
-log "restart requested (host=$BIND_HOST port=$PORT shell=$SHELL_CMD token_file=$TOKEN_FILE)"
+log "restart requested (host=$BIND_HOST port=$PORT shell=$SHELL_CMD)"
 
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet server-console.service; then
   log "server-console.service is active, restarting via systemctl"
@@ -70,7 +69,7 @@ log "port $PORT released, starting new gateway"
 
 # Start the new gateway fully detached, logging to its own file.
 GATEWAY_LOG="$ROOT_DIR/scripts/gateway.log"
-BIND_HOST="$BIND_HOST" PORT="$PORT" SHELL_CMD="$SHELL_CMD" TOKEN_FILE="$TOKEN_FILE" \
+BIND_HOST="$BIND_HOST" PORT="$PORT" SHELL_CMD="$SHELL_CMD" \
   setsid nohup bash "$ROOT_DIR/scripts/start-server.sh" >>"$GATEWAY_LOG" 2>&1 &
 NEW_PID=$!
 log "launched start-server.sh (launcher pid=$NEW_PID), gateway log -> $GATEWAY_LOG"

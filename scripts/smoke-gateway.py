@@ -17,7 +17,6 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 GATEWAY = ROOT_DIR / "gateway" / "server_console_gateway.py"
-TOKEN = "smoke-test-token-12345"
 
 
 def main() -> int:
@@ -32,9 +31,6 @@ def main() -> int:
             str(port),
             "--mode",
             "demo",
-            "--token",
-            TOKEN,
-            "--require-token",
         ],
         cwd=ROOT_DIR,
         stdout=subprocess.PIPE,
@@ -45,7 +41,7 @@ def main() -> int:
     try:
         wait_for_http(port, process)
         test_static_assets(port)
-        test_websocket_auth(port)
+        test_websocket_handshake(port)
         print(f"OK smoke gateway on 127.0.0.1:{port}")
         return 0
     finally:
@@ -97,20 +93,12 @@ def test_static_assets(port: int) -> None:
         raise AssertionError(f"app.js should be immutable, got {cache_control!r}")
 
 
-def test_websocket_auth(port: int) -> None:
-    status, _headers, _body = websocket_handshake(port, token="", origin=f"http://127.0.0.1:{port}")
-    if status != 401:
-        raise AssertionError(f"missing token should be 401, got {status}")
-
-    status, _headers, _body = websocket_handshake(port, token="wrong-token", origin=f"http://127.0.0.1:{port}")
-    if status != 401:
-        raise AssertionError(f"wrong token should be 401, got {status}")
-
-    status, _headers, _body = websocket_handshake(port, token=TOKEN, origin="")
+def test_websocket_handshake(port: int) -> None:
+    status, _headers, _body = websocket_handshake(port, origin="")
     if status != 403:
         raise AssertionError(f"missing origin should be 403, got {status}")
 
-    status, headers, body = websocket_handshake(port, token=TOKEN, origin=f"http://127.0.0.1:{port}", keep_open=True)
+    status, headers, body = websocket_handshake(port, origin=f"http://127.0.0.1:{port}", keep_open=True)
     if status != 101:
         raise AssertionError(f"valid websocket should be 101, got {status}")
     if headers.get("sec-websocket-protocol", "").lower() != "server-console":
@@ -150,15 +138,11 @@ def assert_header(response: HttpResponse, key: str, expected: str) -> None:
 
 def websocket_handshake(
     port: int,
-    token: str,
     origin: str,
     keep_open: bool = False,
 ) -> tuple[int, dict[str, str], bytes]:
     host = f"127.0.0.1:{port}"
     key = base64.b64encode(os.urandom(16)).decode("ascii")
-    protocols = ["server-console"]
-    if token:
-        protocols.append(f"server-console-token.{base64_url_encode(token)}")
 
     lines = [
         "GET /terminal?session=smoke HTTP/1.1",
@@ -167,7 +151,7 @@ def websocket_handshake(
         "Connection: Upgrade",
         f"Sec-WebSocket-Key: {key}",
         "Sec-WebSocket-Version: 13",
-        f"Sec-WebSocket-Protocol: {', '.join(protocols)}",
+        "Sec-WebSocket-Protocol: server-console",
     ]
     if origin:
         lines.append(f"Origin: {origin}")
@@ -249,10 +233,6 @@ def send_close_frame(sock: socket.socket) -> None:
     mask = os.urandom(4)
     payload = b""
     sock.sendall(struct.pack("!BB", 0x88, 0x80 | len(payload)) + mask)
-
-
-def base64_url_encode(value: str) -> str:
-    return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
 
 
 if __name__ == "__main__":

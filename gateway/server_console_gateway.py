@@ -15,7 +15,6 @@ import base64
 import binascii
 import gzip
 import hashlib
-import hmac
 import json
 import mimetypes
 import os
@@ -84,8 +83,6 @@ STATIC_FILE_CACHE: dict[str, tuple[int, int, bytes, str, Optional[bytes]]] = {}
 class GatewayConfig:
     host: str
     port: int
-    token: str
-    require_token: bool
     shell: str
     cols: int
     rows: int
@@ -164,46 +161,6 @@ def websocket_protocol_values(headers: dict[str, str]) -> list[str]:
         for value in headers.get("sec-websocket-protocol", "").split(",")
         if value.strip()
     ]
-
-
-def token_from_subprotocol(headers: dict[str, str]) -> str:
-    prefix = "server-console-token."
-    for value in websocket_protocol_values(headers):
-        if not value.startswith(prefix):
-            continue
-        encoded = value[len(prefix):]
-        padding = "=" * (-len(encoded) % 4)
-        try:
-            return base64.urlsafe_b64decode((encoded + padding).encode("ascii")).decode("utf-8")
-        except (binascii.Error, UnicodeDecodeError):
-            return ""
-    return ""
-
-
-def request_tokens(request_line: str, headers: dict[str, str]) -> list[str]:
-    parts = request_line.split()
-    if len(parts) < 2:
-        return []
-
-    parsed = urllib.parse.urlparse(parts[1])
-    params = urllib.parse.parse_qs(parsed.query)
-    tokens = [token for token in params.get("token", []) if token]
-    protocol_token = token_from_subprotocol(headers)
-    if protocol_token:
-        tokens.append(protocol_token)
-    return tokens
-
-
-def validate_path_and_token(request_line: str, headers: dict[str, str], expected_token: str) -> bool:
-    parts = request_line.split()
-    if len(parts) < 2:
-        return False
-
-    parsed = urllib.parse.urlparse(parts[1])
-    if parsed.path != "/terminal":
-        return False
-
-    return any(hmac.compare_digest(token, expected_token) for token in request_tokens(request_line, headers))
 
 
 def validate_same_origin(headers: dict[str, str]) -> bool:
@@ -468,9 +425,6 @@ async def complete_handshake(
     request_line: str,
     headers: dict[str, str],
 ) -> bool:
-    if config.require_token and not validate_path_and_token(request_line, headers, config.token):
-        await send_http_error(writer, 401, "Unauthorized")
-        return False
     if not validate_same_origin(headers):
         await send_http_error(writer, 403, "Forbidden")
         return False
@@ -1821,9 +1775,6 @@ def parse_args() -> GatewayConfig:
     parser = argparse.ArgumentParser(description="WebSocket to PTY gateway for Server Console")
     parser.add_argument("--host", default="127.0.0.1", help="bind host")
     parser.add_argument("--port", default=8765, type=int, help="bind port")
-    parser.add_argument("--token", default="", help="shared connection token")
-    parser.add_argument("--token-file", help="file containing the shared connection token")
-    parser.add_argument("--require-token", action="store_true", help="require token authentication")
     parser.add_argument("--shell", default=default_shell(), help="shell command to run")
     parser.add_argument("--cols", default=100, type=int, help="initial terminal columns")
     parser.add_argument("--rows", default=30, type=int, help="initial terminal rows")
@@ -1835,30 +1786,15 @@ def parse_args() -> GatewayConfig:
     )
     args = parser.parse_args()
 
-    token = args.token or ""
-    if args.token_file:
-        with open(args.token_file, "r", encoding="utf-8") as file:
-            token = file.read().strip()
-
     mode = args.mode
     if mode == "auto":
         mode = "pty" if PTY_AVAILABLE else "demo"
     if mode == "pty" and not PTY_AVAILABLE:
         raise SystemExit("PTY mode requires a Unix-like server. Use --mode demo on Windows.")
 
-    require_token = args.require_token
-    if require_token and not token:
-        raise SystemExit("Use --token or --token-file when --require-token is set.")
-    if require_token and len(token) < 12:
-        raise SystemExit("Use a token with at least 12 characters.")
-    if require_token and mode == "pty" and token == "change-me-dev-token":
-        raise SystemExit("Do not use the demo token in PTY mode. Generate a random token file first.")
-
     return GatewayConfig(
         host=args.host,
         port=args.port,
-        token=token,
-        require_token=require_token,
         shell=args.shell,
         cols=args.cols,
         rows=args.rows,

@@ -8,8 +8,6 @@ Type=simple
 WorkingDirectory=/opt/server-console
 Environment=BIND_HOST=127.0.0.1
 Environment=PORT=8765
-Environment=REQUIRE_TOKEN=1
-Environment=TOKEN_FILE=/etc/server-console/token
 Environment="SHELL_CMD=tmux new-session -A -s phone"
 ExecStart=/opt/server-console/scripts/start-server.sh
 Restart=always

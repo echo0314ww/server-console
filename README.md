@@ -46,17 +46,14 @@ This preview does not execute real server commands. It proves the mobile UI, Web
 ### Linux Server
 
 ```bash
-umask 077
-openssl rand -hex 24 > .server-console-token
-BIND_HOST=127.0.0.1 TOKEN_FILE=.server-console-token SHELL_CMD="tmux new-session -A -s phone" ./scripts/start-server.sh
+BIND_HOST=127.0.0.1 SHELL_CMD="tmux new-session -A -s phone" ./scripts/start-server.sh
 ```
 
-`scripts/start-server.sh` requires token authentication by default. For local LAN
-testing you can bind to `0.0.0.0`, but do not expose it to the public internet
-without TLS and a reverse proxy:
+For local LAN testing you can bind to `0.0.0.0`, but do not expose it to the
+public internet without TLS and a reverse proxy:
 
 ```bash
-BIND_HOST=0.0.0.0 TOKEN_FILE=.server-console-token ./scripts/start-server.sh
+BIND_HOST=0.0.0.0 ./scripts/start-server.sh
 ```
 
 Then open this URL on your iPhone:
@@ -81,8 +78,8 @@ wss://your-domain.example/terminal?session=phone
 
 The repository includes a hardened systemd starting point at
 `deploy/systemd/server-console.service`. Install it only after creating a
-restricted `server-console` user and a token file that only that service user
-can read, such as `/etc/server-console/token`.
+restricted `server-console` user and deciding how the service should be reached
+through your reverse proxy.
 
 ## Native iOS App Is Optional
 
@@ -111,8 +108,7 @@ python3 scripts/smoke-gateway.py
 ```
 
 It starts a temporary demo gateway and verifies static assets, cache headers,
-WebSocket token rejection, Origin rejection, and a successful authenticated
-WebSocket handshake.
+Origin rejection, and a successful same-origin WebSocket handshake.
 
 ## Protocol
 
@@ -130,11 +126,6 @@ Client to server:
 ```
 
 Binary client input frames are `[0x00][raw terminal bytes]`.
-
-When token auth is enabled, the browser sends the token through the
-`server-console-token.<base64url-token>` WebSocket subprotocol. Query-string
-tokens are still accepted by the gateway for compatibility, but the PWA strips
-them from the visible URL before saving settings.
 
 Server to client:
 
@@ -156,8 +147,6 @@ This is intentionally a prototype, but it controls a server shell and must be tr
 
 - Do not run the gateway as root.
 - Prefer `127.0.0.1` plus a TLS reverse proxy.
-- Keep token authentication enabled; `scripts/start-server.sh` requires it unless
-  `REQUIRE_TOKEN=0` is explicitly set for trusted local development.
 - Add user authentication before sharing this with anyone.
 - Add audit logging for commands and connection metadata.
 - Consider command allowlists or isolated containers for production.

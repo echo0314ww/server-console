@@ -23,7 +23,7 @@
 - `gateway/server_console_gateway.py`：Python 标准库实现的 HTTP 静态文件服务 + WebSocket 终端网关。
 - `scripts/start-preview.ps1`：Windows demo 预览脚本。
 - `scripts/start-server.sh`：Linux 服务器真实 PTY 启动脚本。
-- `scripts/smoke-gateway.py`：网关静态资源、认证、Origin 和握手冒烟测试。
+- `scripts/smoke-gateway.py`：网关静态资源、Origin 和握手冒烟测试。
 - `deploy/systemd/server-console.service`：生产部署用 systemd 模板。
 - `README.md`：当前主要使用说明。
 - `docs/subagent-security-notes.md`：安全和协议建议。
@@ -37,11 +37,10 @@
 1. 建立了 PWA 前端。
 2. 建立了 Python 网关，设计为：
    - `/`、`/app.js`、`/styles.css` 等路径返回静态网页资源。
-   - `/terminal?session=...` 升级为 WebSocket，token 通过 WebSocket subprotocol 传递；旧的 `?token=` 仍保留兼容。
+   - `/terminal?session=...` 升级为 WebSocket。
 3. WebSocket 协议使用 JSON 文本消息处理控制流；终端输入/输出优先用二进制帧，JSON/base64 保留兼容。
 4. 前端已支持：
    - WebSocket URL 输入。
-   - Access Token 单独输入，避免把 token 写进 URL/localStorage。
    - Connect / Disconnect。
    - 实时输出滚动。
    - 本地命令输入框。
@@ -57,8 +56,7 @@
 
 - Windows 本地无法提供真实 Unix PTY，所以只能跑 demo 预览。
 - 真实命令执行需要把项目迁移到 Linux/macOS 服务器后运行 `--mode pty`。
-- `scripts/start-server.sh` 默认要求 token。只有明确设置 `REQUIRE_TOKEN=0` 时才会关闭认证，不能用于公网。
-- 当前安全模型仍是原型级别，仅有 token，不能直接暴露公网生产使用。
+- 当前没有内置访问认证，不能直接暴露公网生产使用。
 
 ## 迁移到服务器后的建议步骤
 
@@ -72,12 +70,10 @@ cd /path/to/server
 
 ```bash
 chmod +x scripts/start-server.sh
-umask 077
-openssl rand -hex 24 > .server-console-token
-BIND_HOST=127.0.0.1 PORT=8765 TOKEN_FILE=.server-console-token ./scripts/start-server.sh
+BIND_HOST=127.0.0.1 PORT=8765 ./scripts/start-server.sh
 ```
 
-如果要用 systemd，先创建受限用户和 token 文件，再参考 `deploy/systemd/server-console.service` 安装到 `/etc/systemd/system/server-console.service`。不要用 root 长期运行网关。
+如果要用 systemd，先创建受限用户，再参考 `deploy/systemd/server-console.service` 安装到 `/etc/systemd/system/server-console.service`。不要用 root 长期运行网关。
 
 然后在手机 Safari 打开：
 
@@ -88,7 +84,7 @@ http://SERVER_IP:8765/
 如果要用可恢复会话，建议改成 tmux：
 
 ```bash
-BIND_HOST=127.0.0.1 PORT=8765 TOKEN_FILE=.server-console-token SHELL_CMD="tmux new-session -A -s phone" ./scripts/start-server.sh
+BIND_HOST=127.0.0.1 PORT=8765 SHELL_CMD="tmux new-session -A -s phone" ./scripts/start-server.sh
 ```
 
 ## 迁移后优先验证
@@ -96,7 +92,7 @@ BIND_HOST=127.0.0.1 PORT=8765 TOKEN_FILE=.server-console-token SHELL_CMD="tmux n
 1. 服务器上运行：
 
 ```bash
-python3 gateway/server_console_gateway.py --host 127.0.0.1 --port 8765 --token-file .server-console-token --require-token --mode pty
+python3 gateway/server_console_gateway.py --host 127.0.0.1 --port 8765 --mode pty
 ```
 
 2. 浏览器打开：
@@ -135,12 +131,12 @@ while true; do date; sleep 1; done
 
 ## 注意
 
-不要把 `--host 0.0.0.0` + 示例 token 或弱 token 直接暴露公网。
+不要把 `--host 0.0.0.0` 直接暴露公网。
 
 更安全的服务器启动方式是：
 
 ```bash
-python3 gateway/server_console_gateway.py --host 127.0.0.1 --port 8765 --token "随机长token" --mode pty
+python3 gateway/server_console_gateway.py --host 127.0.0.1 --port 8765 --mode pty
 ```
 
 然后用 HTTPS 反向代理暴露给手机。

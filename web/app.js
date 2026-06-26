@@ -31,7 +31,6 @@ const serverUrlStorageKey = "server-console.websocket-url.v2";
 const legacyServerUrlStorageKey = "server-console.websocket-url";
 const autoConnectStorageKey = "server-console.auto-connect";
 const connectionCollapsedStorageKey = "server-console.connection-collapsed";
-const transientTokenStorageKey = "server-console.websocket-token";
 const reconnectBaseDelayMs = 1000;
 const reconnectMaxDelayMs = 8000;
 const closeBeforeReconnectDelayMs = 300;
@@ -120,13 +119,12 @@ let draftSubmitPending = false;
 let userReviewingOutput = false;
 let lastOutputSequence = 0;
 let activeSessionCreatedAt = 0;
-let transientConnectionToken = "";
 let currentCwd = "";
 let terminalViewportElement = null;
 let terminalResizeObserver = null;
 let terminalFitRetryTimer = 0;
 let terminalFitRetryCount = 0;
-let terminalBottomSettleToken = 0;
+let terminalBottomSettleGeneration = 0;
 let compactViewportMediaQuery = null;
 let compactViewportMatches = false;
 let compactViewportClassApplied = null;
@@ -159,9 +157,8 @@ if (nativeWrapperMode) {
   rootElement.setAttribute("data-native-wrapper", "1");
 }
 initViewportCache();
-rememberPageToken();
 const initialWebSocketUrl = nativeBootstrapServerUrl || savedWebSocketUrl();
-serverUrl.value = stripTokenFromUrl(initialWebSocketUrl);
+serverUrl.value = normalizedWebSocketUrl(initialWebSocketUrl);
 if (nativeBootstrapEnabled) {
   rememberAutoConnect(true);
 }
@@ -421,7 +418,6 @@ function savedWebSocketUrl() {
 
 function persistServerUrl() {
   const rawValue = withDefaultSession(serverUrl.value.trim());
-  rememberTransientToken(rawValue);
   const value = normalizedWebSocketUrl(rawValue);
   if (!value) return;
   if (serverUrl.value !== value) {
@@ -440,24 +436,12 @@ function persistServerUrl() {
   }
 }
 
-function stripTokenFromUrl(value) {
-  if (!value) return value;
-
-  try {
-    const parsed = new URL(value, location.href);
-    parsed.searchParams.delete("token");
-    return parsed.toString();
-  } catch {
-    return value;
-  }
-}
-
 function websocketUrl() {
   return normalizedWebSocketUrl(serverUrl.value.trim());
 }
 
 function normalizedWebSocketUrl(value) {
-  return upgradeSameHostWebSocketForSecurePage(stripTokenFromUrl(withDefaultSession(value)));
+  return upgradeSameHostWebSocketForSecurePage(withDefaultSession(value));
 }
 
 function upgradeSameHostWebSocketForSecurePage(value) {
@@ -477,19 +461,7 @@ function upgradeSameHostWebSocketForSecurePage(value) {
 }
 
 function websocketProtocols() {
-  const protocols = ["server-console"];
-  const token = currentConnectionToken();
-  if (token) {
-    protocols.push(`server-console-token.${base64UrlEncodeUtf8(token)}`);
-  }
-  return protocols;
-}
-
-function base64UrlEncodeUtf8(value) {
-  return bytesToBase64(encoder.encode(value))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
+  return ["server-console"];
 }
 
 function withDefaultSession(value) {
@@ -514,59 +486,6 @@ function sessionNameFromUrl(value) {
     return parsed.searchParams.get("session") || "phone";
   } catch {
     return "phone";
-  }
-}
-
-function rememberTransientToken(value) {
-  const token = tokenFromUrl(value);
-  if (!token) return;
-
-  rememberToken(token);
-}
-
-function rememberPageToken() {
-  const token = tokenFromUrl(location.href);
-  if (!token) return;
-
-  rememberToken(token);
-
-  try {
-    const cleaned = new URL(location.href);
-    cleaned.searchParams.delete("token");
-    history.replaceState(null, "", `${cleaned.pathname}${cleaned.search}${cleaned.hash}`);
-  } catch {
-    // The token is still available for this tab even if URL cleanup fails.
-  }
-}
-
-function rememberToken(token) {
-  transientConnectionToken = token;
-  try {
-    sessionStorage.setItem(transientTokenStorageKey, token);
-  } catch {
-    // Token persistence is best-effort; the current URL still works for this connect attempt.
-  }
-}
-
-function currentConnectionToken() {
-  const directToken = tokenFromUrl(serverUrl.value);
-  if (directToken) return directToken;
-  if (transientConnectionToken) return transientConnectionToken;
-
-  try {
-    return sessionStorage.getItem(transientTokenStorageKey) || "";
-  } catch {
-    return "";
-  }
-}
-
-function tokenFromUrl(value) {
-  if (!value) return "";
-
-  try {
-    return new URL(value, location.href).searchParams.get("token") || "";
-  } catch {
-    return "";
   }
 }
 
@@ -1772,7 +1691,7 @@ function markUserReviewingOutput() {
     updateNewOutputButton();
     return;
   }
-  terminalBottomSettleToken += 1;
+  terminalBottomSettleGeneration += 1;
   pauseTerminalOutputFlush();
   followLatestOutput = false;
   hasUnreadOutput = true;
@@ -1965,9 +1884,9 @@ function forceTerminalViewportToBottom() {
 }
 
 function scrollTerminalToBottomSoon(forceStayAtBottom = false) {
-  const token = terminalBottomSettleToken;
+  const generation = terminalBottomSettleGeneration;
   requestAnimationFrame(() => {
-    if (token !== terminalBottomSettleToken) return;
+    if (generation !== terminalBottomSettleGeneration) return;
     if ((forceStayAtBottom || shouldAutoFollowLatest()) && !shouldHoldTerminalOutputForReview()) {
       scrollTerminalToBottom();
     }
@@ -1975,15 +1894,15 @@ function scrollTerminalToBottomSoon(forceStayAtBottom = false) {
 }
 
 function scheduleTerminalBottomSettle() {
-  const token = terminalBottomSettleToken;
+  const generation = terminalBottomSettleGeneration;
   scrollTerminalToBottomSoon(true);
   window.setTimeout(() => {
-    if (token === terminalBottomSettleToken && !shouldHoldTerminalOutputForReview()) {
+    if (generation === terminalBottomSettleGeneration && !shouldHoldTerminalOutputForReview()) {
       scrollTerminalToBottomSoon(true);
     }
   }, 80);
   window.setTimeout(() => {
-    if (token === terminalBottomSettleToken && !shouldHoldTerminalOutputForReview()) {
+    if (generation === terminalBottomSettleGeneration && !shouldHoldTerminalOutputForReview()) {
       scrollTerminalToBottomSoon(true);
     }
   }, 260);
